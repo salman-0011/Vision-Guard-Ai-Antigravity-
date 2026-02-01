@@ -1,0 +1,155 @@
+"""
+VisionGuard AI - AI Worker Configuration
+
+Type-safe configuration for single-model AI workers.
+Config-driven worker specialization (one worker = one model = one queue).
+"""
+
+from typing import Optional
+from pydantic import BaseModel, Field, validator
+import os
+
+
+class WorkerConfig(BaseModel):
+    """
+    Configuration for a single-model AI worker.
+    
+    Each worker instance is specialized for ONE model type and ONE Redis queue.
+    """
+    
+    # Worker specialization
+    model_type: str = Field(..., description="Model type: 'weapon', 'fire', 'fall'")
+    redis_input_queue: str = Field(
+        ...,
+        description="Redis queue to consume from: 'vg:critical', 'vg:high', 'vg:medium'"
+    )
+    onnx_model_path: str = Field(..., description="Path to ONNX model file")
+    confidence_threshold: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence threshold for results"
+    )
+    
+    # Redis configuration
+    redis_host: str = Field(default="localhost", description="Redis host")
+    redis_port: int = Field(default=6379, ge=1, le=65535, description="Redis port")
+    redis_db: int = Field(default=0, ge=0, description="Redis database number")
+    redis_password: Optional[str] = Field(default=None, description="Redis password (optional)")
+    redis_timeout: int = Field(default=1, ge=1, description="Redis blocking timeout in seconds")
+    
+    # ONNX Runtime configuration (CPU-only)
+    intra_op_num_threads: int = Field(
+        default=4,
+        ge=1,
+        description="ONNX intra-op threads (must not exceed CPU cores / worker_count)"
+    )
+    inter_op_num_threads: int = Field(
+        default=2,
+        ge=1,
+        description="ONNX inter-op threads"
+    )
+    
+    # Model-specific preprocessing
+    input_width: int = Field(default=640, ge=32, description="Model input width")
+    input_height: int = Field(default=640, ge=32, description="Model input height")
+    normalize_mean: list = Field(
+        default=[0.485, 0.456, 0.406],
+        description="Normalization mean (ImageNet default)"
+    )
+    normalize_std: list = Field(
+        default=[0.229, 0.224, 0.225],
+        description="Normalization std (ImageNet default)"
+    )
+    
+    # Logging
+    log_level: str = Field(default="INFO", description="Log level")
+    log_format: str = Field(default="json", description="Log format (json/text)")
+    
+    # Shared memory (reuses camera module's implementation)
+    shared_memory_max_size_mb: int = Field(
+        default=10,
+        ge=1,
+        description="Max frame size in shared memory (MB)"
+    )
+    
+    @validator('model_type')
+    def validate_model_type(cls, v):
+        valid_types = ['weapon', 'fire', 'fall']
+        if v not in valid_types:
+            raise ValueError(f'model_type must be one of {valid_types}')
+        return v
+    
+    @validator('redis_input_queue')
+    def validate_redis_queue(cls, v):
+        valid_queues = ['vg:critical', 'vg:high', 'vg:medium']
+        if v not in valid_queues:
+            raise ValueError(f'redis_input_queue must be one of {valid_queues}')
+        return v
+    
+    @validator('onnx_model_path')
+    def validate_model_path(cls, v):
+        if not v.endswith('.onnx'):
+            raise ValueError('onnx_model_path must end with .onnx')
+        if not os.path.exists(v):
+            raise ValueError(f'ONNX model file not found: {v}')
+        return v
+    
+    @validator('log_level')
+    def validate_log_level(cls, v):
+        valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+        if v.upper() not in valid_levels:
+            raise ValueError(f'log_level must be one of {valid_levels}')
+        return v.upper()
+    
+    @validator('log_format')
+    def validate_log_format(cls, v):
+        if v not in ['json', 'text']:
+            raise ValueError('log_format must be "json" or "text"')
+        return v
+    
+    @validator('normalize_mean', 'normalize_std')
+    def validate_normalization(cls, v):
+        if len(v) != 3:
+            raise ValueError('Normalization values must have 3 elements (RGB)')
+        return v
+    
+    class Config:
+        """Pydantic configuration."""
+        validate_assignment = True
+        extra = 'forbid'
+
+
+class ResultMetadata(BaseModel):
+    """
+    Inference result metadata structure.
+    
+    This is published to Redis stream for Event Classification Service.
+    CRITICAL: Includes shared_memory_key for frame cleanup by Event Classification.
+    """
+    
+    camera_id: str
+    frame_id: str
+    shared_memory_key: str  # REQUIRED for Event Classification cleanup
+    model: str
+    confidence: float
+    bbox: Optional[list] = None  # [x1, y1, x2, y2] for object detection
+    timestamp: float
+    inference_latency_ms: float  # REQUIRED for capacity planning
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for Redis serialization."""
+        result = {
+            "camera_id": self.camera_id,
+            "frame_id": self.frame_id,
+            "shared_memory_key": self.shared_memory_key,
+            "model": self.model,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp,
+            "inference_latency_ms": self.inference_latency_ms
+        }
+        
+        if self.bbox is not None:
+            result["bbox"] = self.bbox
+        
+        return result

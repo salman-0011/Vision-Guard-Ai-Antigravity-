@@ -1,0 +1,23 @@
+# Add virtual environment to gitignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+test_metrics.json
+test_report.txt
+*.onnx
+*.weights
+*.pt
+.env
+.venv

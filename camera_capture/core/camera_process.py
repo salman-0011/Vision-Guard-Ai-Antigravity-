@@ -1,0 +1,373 @@
+"""
+VisionGuard AI - Camera Process
+
+Single camera process logic.
+Runs in dedicated OS process for isolation and stability.
+"""
+
+import time
+import signal
+import logging
+from multiprocessing import Process, Event
+from typing import Optional
+from ..config import CameraConfig, RedisConfig, BufferConfig, RetryConfig, SharedMemoryConfig
+from ..capture.rtsp_handler import RTSPHandler
+from ..capture.frame_grabber import FrameGrabber
+from ..detection.motion_detector import MotionDetector
+from ..queue.redis_producer import RedisProducer
+from ..queue.task_models import TaskMetadata
+from ..storage.shared_memory_impl import SharedMemoryImpl
+from ..utils.logging import setup_logging
+
+
+class CameraProcess:
+    """
+    Single camera capture process.
+    
+    Main loop:
+    1. Connect to RTSP stream
+    2. Grab frame at configured FPS
+    3. Run motion detection
+    4. If motion detected:
+       - Write frame to shared memory
+       - Enqueue task to Redis
+    5. Handle errors (reconnect, skip, log)
+    """
+    
+    def __init__(
+        self,
+        camera_config: CameraConfig,
+        redis_config: RedisConfig,
+        buffer_config: BufferConfig,
+        retry_config: RetryConfig,
+        shared_memory_config: SharedMemoryConfig,
+        log_level: str = "INFO",
+        log_format: str = "json"
+    ):
+        """
+        Initialize camera process.
+        
+        Args:
+            camera_config: Camera configuration
+            redis_config: Redis configuration
+            buffer_config: Buffer configuration
+            retry_config: Retry configuration
+            shared_memory_config: Shared memory configuration
+            log_level: Log level
+            log_format: Log format (json/text)
+        """
+        self.camera_config = camera_config
+        self.redis_config = redis_config
+        self.buffer_config = buffer_config
+        self.retry_config = retry_config
+        self.shared_memory_config = shared_memory_config
+        self.log_level = log_level
+        self.log_format = log_format
+        
+        # Process control
+        self.process: Optional[Process] = None
+        self.stop_event = Event()
+        
+        # Components (initialized in process)
+        self.rtsp_handler: Optional[RTSPHandler] = None
+        self.frame_grabber: Optional[FrameGrabber] = None
+        self.motion_detector: Optional[MotionDetector] = None
+        self.redis_producer: Optional[RedisProducer] = None
+        self.shared_memory: Optional[SharedMemoryImpl] = None
+        self.logger: Optional[logging.Logger] = None
+    
+    def start(self) -> bool:
+        """
+        Start camera process.
+        
+        Returns:
+            True if process started successfully
+        """
+        self.stop_event.clear()
+        
+        self.process = Process(
+            target=self._run,
+            name=f"CameraProcess-{self.camera_config.camera_id}",
+            daemon=False
+        )
+        self.process.start()
+        
+        return self.process.is_alive()
+    
+    def stop(self, timeout: float = 10.0) -> None:
+        """
+        Stop camera process gracefully.
+        
+        Args:
+            timeout: Maximum time to wait for process to stop
+        """
+        if not self.process:
+            return
+        
+        # Signal process to stop
+        self.stop_event.set()
+        
+        # Wait for process to finish
+        self.process.join(timeout=timeout)
+        
+        # Force terminate if still alive
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=2.0)
+        
+        # Force kill if still alive
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join()
+    
+    def is_alive(self) -> bool:
+        """Check if process is alive."""
+        return self.process is not None and self.process.is_alive()
+    
+    def _run(self) -> None:
+        """
+        Main process loop (runs in separate process).
+        
+        This is the entry point for the camera process.
+        """
+        # Setup logging for this process
+        self.logger = setup_logging(
+            level=self.log_level,
+            format_type=self.log_format,
+            camera_id=self.camera_config.camera_id
+        )
+        
+        self.logger.info(
+            f"Camera process starting",
+            extra={"camera_id": self.camera_config.camera_id}
+        )
+        
+        try:
+            # Initialize components
+            if not self._initialize():
+                self.logger.error("Failed to initialize camera process")
+                return
+            
+            # Main capture loop
+            self._capture_loop()
+            
+        except Exception as e:
+            self.logger.error(
+                f"Fatal error in camera process: {e}",
+                extra={"error": str(e)}
+            )
+        finally:
+            # Cleanup
+            self._shutdown()
+    
+    def _initialize(self) -> bool:
+        """
+        Initialize all components.
+        
+        Returns:
+            True if initialization successful
+        """
+        try:
+            # Initialize RTSP handler
+            self.rtsp_handler = RTSPHandler(
+                rtsp_url=self.camera_config.rtsp_url,
+                camera_id=self.camera_config.camera_id,
+                retry_config=self.retry_config
+            )
+            
+            # Connect to RTSP stream
+            if not self.rtsp_handler.connect():
+                self.logger.error("Failed to connect to RTSP stream")
+                return False
+            
+            # Initialize frame grabber
+            self.frame_grabber = FrameGrabber(
+                fps=self.camera_config.fps,
+                camera_id=self.camera_config.camera_id
+            )
+            
+            # Initialize motion detector
+            self.motion_detector = MotionDetector(
+                threshold=self.camera_config.motion_threshold
+            )
+            
+            # Initialize shared memory
+            self.shared_memory = SharedMemoryImpl(
+                max_frame_size_mb=self.shared_memory_config.max_frame_size_mb
+            )
+            
+            # Initialize Redis producer
+            self.redis_producer = RedisProducer(
+                redis_config=self.redis_config,
+                buffer_config=self.buffer_config,
+                camera_id=self.camera_config.camera_id
+            )
+            
+            # Connect to Redis
+            self.redis_producer.connect()
+            
+            self.logger.info("Camera process initialized successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(
+                f"Initialization failed: {e}",
+                extra={"error": str(e)}
+            )
+            return False
+    
+    def _capture_loop(self) -> None:
+        """Main capture loop."""
+        self.logger.info("Starting capture loop")
+        
+        consecutive_failures = 0
+        max_consecutive_failures = 10
+        
+        while not self.stop_event.is_set():
+            try:
+                # Check if we should capture this frame (FPS throttling)
+                if not self.frame_grabber.should_capture():
+                    time.sleep(0.01)  # Small sleep to prevent busy waiting
+                    continue
+                
+                # Read frame from RTSP stream
+                frame = self.rtsp_handler.read_frame()
+                
+                if frame is None:
+                    # Connection lost, try to reconnect
+                    consecutive_failures += 1
+                    
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.logger.error(
+                            f"Too many consecutive failures ({consecutive_failures}), stopping"
+                        )
+                        break
+                    
+                    self.logger.warning(
+                        f"Failed to read frame, attempting reconnect",
+                        extra={"consecutive_failures": consecutive_failures}
+                    )
+                    
+                    if not self.rtsp_handler.reconnect():
+                        self.logger.error("Reconnection failed")
+                        time.sleep(5.0)  # Wait before next attempt
+                        continue
+                    
+                    continue
+                
+                # Reset failure counter on successful read
+                consecutive_failures = 0
+                
+                # Mark frame as captured
+                self.frame_grabber.mark_captured()
+                
+                # Run motion detection
+                has_motion = self.motion_detector.detect(frame)
+                
+                if not has_motion:
+                    # No motion, skip frame
+                    continue
+                
+                # Motion detected - process frame
+                self._process_frame(frame)
+                
+            except KeyboardInterrupt:
+                self.logger.info("Received keyboard interrupt")
+                break
+            except Exception as e:
+                self.logger.error(
+                    f"Error in capture loop: {e}",
+                    extra={"error": str(e)}
+                )
+                consecutive_failures += 1
+                
+                if consecutive_failures >= max_consecutive_failures:
+                    self.logger.error("Too many errors, stopping")
+                    break
+                
+                time.sleep(1.0)
+        
+        self.logger.info("Capture loop ended")
+    
+    def _process_frame(self, frame) -> None:
+        """
+        Process frame with motion detected.
+        
+        Args:
+            frame: Frame to process
+        """
+        try:
+            # Write frame to shared memory
+            shared_memory_key = self.shared_memory.write_frame(frame)
+            
+            # Generate frame ID
+            frame_id = TaskMetadata.generate_frame_id(self.camera_config.camera_id)
+            
+            # Create task metadata
+            task = TaskMetadata(
+                camera_id=self.camera_config.camera_id,
+                frame_id=frame_id,
+                shared_memory_key=shared_memory_key,
+                timestamp=time.time(),
+                priority="medium"  # Default operational priority
+            )
+            
+            # Enqueue to Redis
+            self.redis_producer.enqueue(task)
+            
+            self.logger.debug(
+                f"Frame processed and enqueued",
+                extra={
+                    "frame_id": frame_id,
+                    "shared_memory_key": shared_memory_key
+                }
+            )
+            
+        except MemoryError as e:
+            # Shared memory full - skip frame safely
+            self.logger.warning(
+                f"Shared memory full, skipping frame: {e}",
+                extra={"error": str(e)}
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Error processing frame: {e}",
+                extra={"error": str(e)}
+            )
+    
+    def _shutdown(self) -> None:
+        """Cleanup resources."""
+        self.logger.info("Shutting down camera process")
+        
+        # Disconnect RTSP
+        if self.rtsp_handler:
+            self.rtsp_handler.disconnect()
+        
+        # Disconnect Redis
+        if self.redis_producer:
+            self.redis_producer.disconnect()
+        
+        # Cleanup shared memory
+        if self.shared_memory:
+            self.shared_memory.cleanup_all()
+        
+        # Log final statistics
+        if self.frame_grabber:
+            self.logger.info(
+                "Frame grabber stats",
+                extra=self.frame_grabber.get_stats()
+            )
+        
+        if self.motion_detector:
+            self.logger.info(
+                "Motion detector stats",
+                extra=self.motion_detector.get_stats()
+            )
+        
+        if self.redis_producer:
+            self.logger.info(
+                "Redis producer stats",
+                extra=self.redis_producer.get_stats()
+            )
+        
+        self.logger.info("Camera process shutdown complete")
