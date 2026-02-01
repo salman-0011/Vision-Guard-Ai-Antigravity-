@@ -1,0 +1,18 @@
+{
+    "cameras": [
+        {
+            "id": "cam_test_01",
+            "name": "Test Camera 1",
+            "source": "/app/test-video.mp4",
+            "fps": 5,
+            "motion_threshold": 0.02,
+            "priority": "medium",
+            "enabled": true
+        }
+    ],
+    "global": {
+        "motion_detection": true,
+        "default_fps": 5,
+        "reconnect_delay_sec": 5
+    }
+}

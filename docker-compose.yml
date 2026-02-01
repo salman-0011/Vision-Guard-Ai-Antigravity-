@@ -1,0 +1,235 @@
+# ============================================================
+# VisionGuard AI - Docker Compose (Edge Deployment)
+# ============================================================
+# Production orchestration for VisionGuard AI system.
+#
+# Services:
+# - redis: Message broker (mandatory)
+# - backend: FastAPI control plane
+# - ecs: Event Classification Service (SINGLETON)
+# - camera: Camera capture service
+# - worker: AI inference workers (scalable)
+#
+# Usage:
+#   docker-compose up -d              # Start all services
+#   docker-compose up -d --scale worker=3  # Scale workers
+#   docker-compose down               # Stop all services
+#
+# ============================================================
+
+version: "3.9"
+
+networks:
+  visionguard:
+    driver: bridge
+    name: visionguard-network
+
+volumes:
+  redis-data:
+    name: vg-redis-data
+  vg-data:
+    name: vg-app-data
+  vg-logs:
+    name: vg-logs
+  vg-shm:
+    name: vg-shared-memory
+
+services:
+  # ============================================================
+  # Redis - Message Broker (MANDATORY)
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    container_name: vg-redis
+    restart: unless-stopped
+    networks:
+      - visionguard
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ============================================================
+  # Backend Supervisor - Control Plane
+  # ============================================================
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: vg-backend
+    restart: unless-stopped
+    stop_grace_period: 15s
+    networks:
+      - visionguard
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - vg-data:/data
+      - vg-logs:/var/log/visionguard
+    environment:
+      - VG_HOST=0.0.0.0
+      - VG_PORT=8000
+      - VG_REDIS_HOST=redis
+      - VG_REDIS_PORT=6379
+      - VG_ENVIRONMENT=${VG_ENVIRONMENT:-production}
+      - VG_LOG_LEVEL=${VG_LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ============================================================
+  # Event Classification Service - SINGLETON (DO NOT SCALE)
+  # ============================================================
+  ecs:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ecs
+    container_name: vg-ecs
+    restart: unless-stopped
+    stop_grace_period: 20s
+    networks:
+      - visionguard
+    volumes:
+      - vg-data:/data
+      - vg-logs:/var/log/visionguard
+      - vg-shm:/dev/shm
+    environment:
+      - ECS_REDIS_HOST=redis
+      - ECS_REDIS_PORT=6379
+      - ECS_LOG_LEVEL=${ECS_LOG_LEVEL:-INFO}
+      - ECS_DATABASE_PATH=/data/events.db
+    depends_on:
+      redis:
+        condition: service_healthy
+    # CRITICAL: ECS is SINGLETON - enforce single replica
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 512M
+
+  # ============================================================
+  # Camera Capture Service
+  # ============================================================
+  camera:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.camera
+    container_name: vg-camera
+    restart: unless-stopped
+    stop_grace_period: 15s
+    networks:
+      - visionguard
+    volumes:
+      - vg-logs:/var/log/visionguard
+      - vg-shm:/dev/shm
+      - ./test-video.mp4:/app/test-video.mp4:ro
+      - ./cameras.json:/app/cameras.json:ro
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CAMERA_CONFIG_PATH=/app/cameras.json
+      - LOG_LEVEL=${CAMERA_LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  # ============================================================
+  # AI Workers - Inference (SCALABLE)
+  # ============================================================
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    stop_grace_period: 35s
+    networks:
+      - visionguard
+    volumes:
+      - vg-logs:/var/log/visionguard
+      - vg-shm:/dev/shm:ro
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKER_MODEL_TYPE=${WORKER_MODEL_TYPE:-weapon}
+      - ONNX_EXECUTION_PROVIDER=CPUExecutionProvider
+      - LOG_LEVEL=${WORKER_LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Workers can be scaled: docker-compose up -d --scale worker=3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ============================================================
+  # AI Worker - GPU (OPTIONAL)
+  # ============================================================
+  # Uncomment to use GPU workers instead of CPU workers
+  # Requires: nvidia-docker runtime
+  #
+  # worker-gpu:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/Dockerfile.worker-gpu
+  #   restart: unless-stopped
+  #   networks:
+  #     - visionguard
+  #   volumes:
+  #     - vg-logs:/var/log/visionguard
+  #     - vg-shm:/dev/shm:ro
+  #   environment:
+  #     - REDIS_HOST=redis
+  #     - REDIS_PORT=6379
+  #     - WORKER_MODEL_TYPE=${WORKER_MODEL_TYPE:-weapon}
+  #     - ONNX_EXECUTION_PROVIDER=CUDAExecutionProvider
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+
+  # ============================================================
+  # Debug UI - Streamlit (TEMPORARY/DEBUG ONLY)
+  # ============================================================
+  debug-ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    container_name: vg-debug-ui
+    restart: unless-stopped
+    networks:
+      - visionguard
+    ports:
+      - "${DEBUG_UI_PORT:-8501}:8501"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - VG_STREAM_NAME=vg:ai:results
+      - VG_REFRESH_SEC=1.5
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - debug
