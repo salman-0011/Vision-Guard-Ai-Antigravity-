@@ -9,10 +9,8 @@ import logging
 import sys
 import os
 
-# Add camera_capture to path to reuse shared memory implementation
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../camera_capture'))
-
-from storage.shared_memory_impl import SharedMemoryImpl
+# Import from camera_capture module
+from camera_capture.storage.shared_memory_impl import SharedMemoryImpl
 import numpy as np
 from typing import Optional
 

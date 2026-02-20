@@ -93,3 +93,68 @@ class EventQueryParams(BaseModel):
     severity: Optional[Severity] = None
     start_time: Optional[str] = None
     end_time: Optional[str] = None
+
+
+# =============================================================
+# Database-backed models (new schema)
+# =============================================================
+
+class DBEvent(BaseModel):
+    """Event from database with temporal fields."""
+    id: str = Field(..., description="UUID v4")
+    camera_id: str
+    event_type: str
+    severity: str
+    start_ts: float = Field(..., description="Event start (epoch seconds)")
+    end_ts: float = Field(..., description="Event end (epoch seconds)")
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    model_version: str
+    created_at: float
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "camera_id": "cam_001",
+                "event_type": "weapon",
+                "severity": "critical",
+                "start_ts": 1738400000.0,
+                "end_ts": 1738400000.42,
+                "confidence": 0.91,
+                "model_version": "1.0.0",
+                "created_at": 1738400001.0
+            }
+        }
+
+
+class DBEventListResponse(BaseModel):
+    """Response model for GET /events (database)."""
+    total: int
+    limit: int
+    offset: int
+    events: List[DBEvent]
+
+
+class DBAlert(BaseModel):
+    """Alert from database."""
+    id: str
+    event_id: str
+    channel: str
+    status: str
+    attempts: int
+    last_attempt_ts: Optional[float] = None
+    created_at: float
+    camera_id: Optional[str] = None
+    event_type: Optional[str] = None
+    severity: Optional[str] = None
+    confidence: Optional[float] = None
+    start_ts: Optional[float] = None
+    end_ts: Optional[float] = None
+
+
+class DBAlertListResponse(BaseModel):
+    """Response model for GET /alerts (database)."""
+    total: int
+    limit: int
+    offset: int
+    alerts: List[DBAlert]

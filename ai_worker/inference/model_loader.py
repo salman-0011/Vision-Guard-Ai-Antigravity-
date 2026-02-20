@@ -7,6 +7,7 @@ Thread tuning for optimal CPU performance.
 
 import onnxruntime as ort
 import logging
+import os
 from typing import List, Tuple
 
 
@@ -43,12 +44,33 @@ class ModelLoader:
         sess_options.inter_op_num_threads = inter_op_num_threads
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         
-        # Load model with CPU provider ONLY
+        # Select execution provider with safe fallback
+        requested_provider = os.getenv("ONNX_EXECUTION_PROVIDER", "CPUExecutionProvider")
+        available_providers = ort.get_available_providers()
+
+        if requested_provider in available_providers:
+            providers = [requested_provider]
+        elif "CPUExecutionProvider" in available_providers:
+            providers = ["CPUExecutionProvider"]
+        else:
+            providers = available_providers[:1] if available_providers else []
+
+        if providers and providers[0] != requested_provider:
+            self.logger.warning(
+                "Requested execution provider not available, falling back",
+                extra={
+                    "requested_provider": requested_provider,
+                    "selected_provider": providers[0],
+                    "available_providers": available_providers
+                }
+            )
+
+        # Load model with selected provider
         try:
             self.session = ort.InferenceSession(
                 model_path,
                 sess_options=sess_options,
-                providers=['CPUExecutionProvider']
+                providers=providers
             )
             
             # Get model metadata
@@ -65,7 +87,8 @@ class ModelLoader:
                     "output_names": self.output_names,
                     "intra_op_threads": intra_op_num_threads,
                     "inter_op_threads": inter_op_num_threads,
-                    "providers": self.session.get_providers()
+                    "providers": self.session.get_providers(),
+                    "requested_provider": requested_provider
                 }
             )
             

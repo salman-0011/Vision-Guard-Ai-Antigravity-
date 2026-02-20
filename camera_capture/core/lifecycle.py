@@ -6,8 +6,11 @@ This is the public API that FastAPI imports and uses.
 """
 
 from typing import Dict
+import logging
 from ..config import CaptureConfig
 from .process_manager import ProcessManager
+
+logger = logging.getLogger(__name__)
 
 
 def start_cameras(config: CaptureConfig) -> ProcessManager:
@@ -67,7 +70,7 @@ def get_status(manager: ProcessManager) -> Dict[str, dict]:
     Example:
         status = get_status(manager)
         for camera_id, info in status.items():
-            print(f"{camera_id}: {info['status']}")
+            logger.info("Camera status", extra={"camera_id": camera_id, "status": info.get("status")})
     """
     return manager.get_status()
 
@@ -85,6 +88,6 @@ def restart_camera(manager: ProcessManager, camera_id: str) -> bool:
         
     Example:
         if not restart_camera(manager, "cam_001"):
-            print("Failed to restart camera")
+            logger.warning("Failed to restart camera")
     """
     return manager.restart_camera(camera_id)

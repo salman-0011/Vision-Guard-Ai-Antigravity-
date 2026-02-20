@@ -10,7 +10,7 @@ import json
 import logging
 from typing import Optional, Deque
 from collections import deque
-from ..queue.task_models import TaskMetadata, REDIS_QUEUES
+from ..redis_queue.task_models import TaskMetadata, REDIS_QUEUES
 from ..config import RedisConfig, BufferConfig
 from ..utils.retry import RetryContext
 

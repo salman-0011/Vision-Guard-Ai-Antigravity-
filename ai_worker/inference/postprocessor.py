@@ -58,6 +58,21 @@ class Postprocessor:
                 # Extract confidence (assuming index 4)
                 confidence = float(detection[4])
                 
+                # Normalize if model outputs percentage scale (0–100)
+                if confidence > 1.0:
+                    confidence = confidence / 100.0
+                
+                # Enforce invariant: confidence must be 0–1
+                if not (0.0 <= confidence <= 1.0):
+                    raise ValueError(
+                        f"[CONFIDENCE SCALE ERROR] Invalid confidence value: {confidence}"
+                    )
+                
+                self.logger.debug(
+                    "Worker confidence normalized",
+                    extra={"confidence": round(confidence, 4)}
+                )
+                
                 # Check threshold
                 if confidence < self.confidence_threshold:
                     self.logger.debug(
@@ -91,6 +106,21 @@ class Postprocessor:
                 # Classification output: (1, num_classes)
                 # Get max confidence
                 confidence = float(np.max(output))
+                
+                # Normalize if model outputs percentage scale (0–100)
+                if confidence > 1.0:
+                    confidence = confidence / 100.0
+                
+                # Enforce invariant: confidence must be 0–1
+                if not (0.0 <= confidence <= 1.0):
+                    raise ValueError(
+                        f"[CONFIDENCE SCALE ERROR] Invalid confidence value: {confidence}"
+                    )
+                
+                self.logger.debug(
+                    "Worker confidence normalized",
+                    extra={"confidence": round(confidence, 4)}
+                )
                 
                 if confidence < self.confidence_threshold:
                     self.logger.debug(

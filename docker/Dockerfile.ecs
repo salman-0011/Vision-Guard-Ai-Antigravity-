@@ -40,10 +40,12 @@ WORKDIR /app
 # Copy requirements - ECS uses pydantic
 COPY event_classification/requirements.txt /app/event_classification/requirements.txt
 RUN pip install --no-cache-dir -r /app/event_classification/requirements.txt 2>/dev/null || \
-    pip install --no-cache-dir pydantic redis
+    pip install --no-cache-dir pydantic redis opencv-python-headless numpy
 
 # Copy application code
 COPY event_classification/ /app/event_classification/
+COPY camera_capture/ /app/camera_capture/
+COPY db/ /app/db/
 
 # Copy supervisor config
 COPY docker/supervisord/ecs.conf /etc/supervisor/conf.d/ecs.conf

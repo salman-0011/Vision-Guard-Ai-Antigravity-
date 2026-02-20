@@ -218,6 +218,12 @@ class AIWorker:
         """Main inference loop."""
         self.logger.info("Starting inference loop")
         
+        # Store base logger to avoid recursive LoggerAdapter wrapping
+        base_logger = self.logger
+
+        last_heartbeat = time.time()
+        heartbeat_interval_sec = 30.0
+        
         while not self.stop_event.is_set():
             try:
                 # 1. Consume task from Redis queue
@@ -227,9 +233,11 @@ class AIWorker:
                     # Timeout - no task available
                     continue
                 
-                # Update logger context with task info
+                # Create fresh adapter from BASE logger (not self.logger!)
+                # Previous code wrapped self.logger repeatedly, causing
+                # RecursionError after ~800 frames
                 self.logger = logging.LoggerAdapter(
-                    self.logger,
+                    base_logger,
                     {
                         'camera_id': task.camera_id,
                         'frame_id': task.frame_id
@@ -239,18 +247,32 @@ class AIWorker:
                 # Track inference timing
                 start_time = time.time()
                 
+                # Log task consumption
+                base_logger.info(
+                    f"Processing task {task.frame_id}",
+                    extra={
+                        "camera_id": task.camera_id,
+                        "model": self.config.model_type,
+                        "shared_memory_key": task.shared_memory_key
+                    }
+                )
+                
                 # 2. Read frame from shared memory (READ-ONLY)
                 frame = self.frame_manager.read_frame(task.shared_memory_key)
                 
                 if frame is None:
-                    self.logger.warning("Frame not found in shared memory, skipping")
+                    base_logger.error(
+                        f"FRAME_NOT_FOUND {task.frame_id}",
+                        extra={
+                            "camera_id": task.camera_id,
+                            "shared_memory_key": task.shared_memory_key
+                        }
+                    )
                     continue
                 
                 # 3. Preprocess
                 input_tensor = self.preprocessor.preprocess(frame)
                 
-
-                time.sleep(0.3)
                 # 4. Run inference
                 output = self.inference_engine.run(input_tensor)
                 
@@ -270,21 +292,37 @@ class AIWorker:
                         model_type=self.config.model_type
                     )
                     
-                    self.logger.info(
-                        f"Inference completed and published",
+                    base_logger.info(
+                        f"DETECTION {task.frame_id} confidence={result.get('confidence', 0):.3f}",
                         extra={
+                            "camera_id": task.camera_id,
+                            "model": self.config.model_type,
                             "confidence": result.get("confidence"),
                             "inference_latency_ms": round(inference_latency_ms, 2)
                         }
                     )
                 else:
-                    self.logger.debug(
-                        f"Result below confidence threshold, not published",
-                        extra={"inference_latency_ms": round(inference_latency_ms, 2)}
+                    base_logger.debug(
+                        f"BELOW_THRESHOLD {task.frame_id}",
+                        extra={
+                            "camera_id": task.camera_id,
+                            "model": self.config.model_type,
+                            "inference_latency_ms": round(inference_latency_ms, 2)
+                        }
                     )
                 
                 # NO CLEANUP - AI Worker is READ-ONLY
                 # Event Classification Service owns frame cleanup
+
+                if time.time() - last_heartbeat >= heartbeat_interval_sec:
+                    base_logger.info(
+                        "AI worker heartbeat",
+                        extra={
+                            "tasks_consumed": self.task_consumer.tasks_consumed,
+                            "publish_failures": self.result_publisher.publish_failures
+                        }
+                    )
+                    last_heartbeat = time.time()
                 
             except KeyboardInterrupt:
                 self.logger.info("Received keyboard interrupt")

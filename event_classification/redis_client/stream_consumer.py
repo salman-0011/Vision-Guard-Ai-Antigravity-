@@ -53,10 +53,11 @@ class StreamMessage:
             id=msg_id,
             frame_id=data["frame_id"],
             camera_id=data["camera_id"],
-            model_type=data["model"],  # Note: field is "model" in stream
+            # Worker sends "model", but we also accept "model_type" for compatibility
+            model_type=data.get("model_type", data.get("model", "unknown")),
             confidence=float(data["confidence"]),
             timestamp=float(data["timestamp"]),
-            shared_memory_key=data["shared_memory_key"],
+            shared_memory_key=data.get("shared_memory_key", ""),  # Optional field
             bbox=bbox,
             inference_latency_ms=float(data.get("inference_latency_ms", 0))
         )

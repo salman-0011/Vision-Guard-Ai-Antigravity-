@@ -5,8 +5,11 @@ Clean startup/shutdown hooks for backend control.
 """
 
 from typing import Dict
+import logging
 from ..config import ECSConfig
 from .service import ECSService
+
+logger = logging.getLogger(__name__)
 
 
 def start_ecs(config: ECSConfig) -> ECSService:
@@ -63,7 +66,7 @@ def get_ecs_status(ecs: ECSService) -> Dict[str, any]:
     Example:
         status = get_ecs_status(ecs)
         if not status["is_alive"]:
-            print("ECS is dead, restarting...")
+            logger.warning("ECS is dead, restarting...")
     """
     return {
         "is_alive": ecs.is_alive(),

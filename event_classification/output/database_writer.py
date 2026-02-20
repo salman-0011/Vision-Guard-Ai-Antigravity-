@@ -2,19 +2,26 @@
 VisionGuard AI - Database Writer
 
 Production SQLite-based event persistence.
-Async batched writes, non-blocking.
+WRITE-ONLY access from ECS.
+
+Derives:
+- start_ts = end_ts - (correlation_age_ms / 1000.0)
+- end_ts = event.timestamp
+
+No modification to Event dataclass.
 """
 
 import logging
 import sqlite3
 import threading
 import queue
-import json
+import uuid
+import time
 import os
 from typing import Optional, List
-from datetime import datetime
 
 from ..classification.event_models import Event
+from db.init_db import init_database, get_db_path
 
 
 class DatabaseWriter:
@@ -22,39 +29,23 @@ class DatabaseWriter:
     Production database writer for classified events.
     
     Features:
-    - SQLite for lightweight persistence
+    - SQLite with WAL mode
     - Async writes via background thread
     - Batched inserts for efficiency
     - Failure never blocks ECS
-    - Config-driven enable/disable
-    """
+    - Derives start_ts/end_ts from correlation_age_ms
     
-    SCHEMA = """
-    CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_id TEXT UNIQUE NOT NULL,
-        event_type TEXT NOT NULL,
-        severity TEXT NOT NULL,
-        camera_id TEXT NOT NULL,
-        frame_id TEXT,
-        timestamp TEXT NOT NULL,
-        confidence REAL,
-        model_type TEXT,
-        bbox TEXT,
-        created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_events_camera ON events(camera_id);
-    CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
-    CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+    WRITE-ONLY: ECS is the sole writer.
     """
     
     def __init__(
         self,
         enabled: bool = True,
-        db_path: str = "./events.db",
+        db_path: str = None,
         batch_size: int = 10,
         flush_interval_sec: float = 5.0,
-        max_queue_size: int = 5000
+        max_queue_size: int = 5000,
+        model_version: str = None
     ):
         """
         Initialize database writer.
@@ -65,12 +56,14 @@ class DatabaseWriter:
             batch_size: Number of events to batch before writing
             flush_interval_sec: Max time before forcing a write
             max_queue_size: Max pending events before dropping
+            model_version: Model version string for DB records
         """
         self.logger = logging.getLogger(__name__)
         self.enabled = enabled
-        self.db_path = db_path
+        self.db_path = db_path or get_db_path()
         self.batch_size = batch_size
         self.flush_interval = flush_interval_sec
+        self.model_version = model_version or os.getenv("VG_MODEL_VERSION", "1.0.0")
         
         # Write queue
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
@@ -89,20 +82,13 @@ class DatabaseWriter:
         
         self.logger.info(
             f"Database writer initialized",
-            extra={"enabled": enabled, "db_path": db_path}
+            extra={"enabled": enabled, "db_path": self.db_path}
         )
     
     def _init_db(self) -> None:
         """Initialize database schema."""
         try:
-            # Ensure directory exists
-            db_dir = os.path.dirname(self.db_path)
-            if db_dir and not os.path.exists(db_dir):
-                os.makedirs(db_dir)
-            
-            conn = sqlite3.connect(self.db_path)
-            conn.executescript(self.SCHEMA)
-            conn.close()
+            init_database(self.db_path)
             self.logger.info(f"Database initialized: {self.db_path}")
         except Exception as e:
             self.logger.error(f"Database init failed: {e}")
@@ -120,7 +106,7 @@ class DatabaseWriter:
     def _worker_loop(self) -> None:
         """Background worker that batches and writes events."""
         batch: List[Event] = []
-        last_flush = datetime.now()
+        last_flush = time.time()
         
         while self._running:
             try:
@@ -133,7 +119,7 @@ class DatabaseWriter:
                     pass
                 
                 # Check if we should flush
-                elapsed = (datetime.now() - last_flush).total_seconds()
+                elapsed = time.time() - last_flush
                 should_flush = (
                     len(batch) >= self.batch_size or
                     (len(batch) > 0 and elapsed >= self.flush_interval)
@@ -142,7 +128,7 @@ class DatabaseWriter:
                 if should_flush:
                     self._write_batch(batch)
                     batch = []
-                    last_flush = datetime.now()
+                    last_flush = time.time()
                     
             except Exception as e:
                 self.logger.error(f"Worker error: {e}")
@@ -150,6 +136,37 @@ class DatabaseWriter:
         # Final flush on shutdown
         if batch:
             self._write_batch(batch)
+    
+    def _derive_timestamps(self, event: Event) -> tuple:
+        """
+        Derive start_ts and end_ts from event.
+        
+        Formula:
+            end_ts = event.timestamp
+            start_ts = end_ts - (event.correlation_age_ms / 1000.0)
+        
+        Returns:
+            (start_ts, end_ts) as floats (epoch seconds)
+        """
+        end_ts = float(event.timestamp)
+        correlation_age_sec = float(event.correlation_age_ms) / 1000.0
+        start_ts = end_ts - correlation_age_sec
+        
+        # Ensure start_ts is never after end_ts
+        if start_ts > end_ts:
+            start_ts = end_ts
+        
+        return (start_ts, end_ts)
+    
+    def _normalize_event_type(self, event_type: str) -> str:
+        """Normalize event type for DB storage."""
+        # Remove "_detected" suffix if present
+        normalized = event_type.lower().replace("_detected", "")
+        return normalized
+    
+    def _normalize_severity(self, severity: str) -> str:
+        """Normalize severity for DB storage."""
+        return severity.lower()
     
     def _write_batch(self, batch: List[Event]) -> None:
         """Write a batch of events to database."""
@@ -160,29 +177,49 @@ class DatabaseWriter:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
+            # Enable foreign keys for this connection
+            cursor.execute("PRAGMA foreign_keys=ON;")
+            
             for event in batch:
                 try:
+                    # Generate UUID
+                    event_uuid = str(uuid.uuid4())
+                    
+                    # Derive timestamps
+                    start_ts, end_ts = self._derive_timestamps(event)
+                    
+                    # Normalize fields
+                    event_type = self._normalize_event_type(event.event_type)
+                    severity = self._normalize_severity(event.severity)
+                    
                     cursor.execute(
                         """
-                        INSERT OR REPLACE INTO events 
-                        (event_id, event_type, severity, camera_id, frame_id,
-                         timestamp, confidence, model_type, bbox, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO events 
+                        (id, camera_id, event_type, severity, start_ts, end_ts, 
+                         confidence, model_version, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            event.event_id,
-                            event.event_type,
-                            event.severity,
+                            event_uuid,
                             event.camera_id,
-                            getattr(event, 'frame_id', None),
-                            event.timestamp,
+                            event_type,
+                            severity,
+                            start_ts,
+                            end_ts,
                             event.confidence,
-                            event.model_type,
-                            json.dumps(getattr(event, 'bbox', None)),
-                            datetime.utcnow().isoformat() + "Z"
+                            self.model_version,
+                            time.time()
                         )
                     )
                     self.events_written += 1
+                    
+                except sqlite3.IntegrityError as e:
+                    # Duplicate or constraint violation - log and continue
+                    self.write_failures += 1
+                    self.logger.warning(
+                        f"Event insert failed (integrity): {e}",
+                        extra={"event_id": event.event_id}
+                    )
                 except sqlite3.Error as e:
                     self.write_failures += 1
                     self.logger.warning(
@@ -235,6 +272,7 @@ class DatabaseWriter:
         """Get writer statistics."""
         return {
             "enabled": self.enabled,
+            "db_path": self.db_path,
             "events_written": self.events_written,
             "events_dropped": self.events_dropped,
             "write_failures": self.write_failures,

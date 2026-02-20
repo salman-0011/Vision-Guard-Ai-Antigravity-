@@ -9,7 +9,6 @@ import os
 import signal
 import logging
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ai_worker import start_worker, stop_worker, WorkerConfig
@@ -20,32 +19,68 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MODEL_QUEUE_MAP = {
+    "weapon": "vg:critical",
+    "fire": "vg:high",
+    "fall": "vg:medium"
+}
+
+
+def find_model_path(model_type: str) -> str:
+    """Find ONNX model path for given model type."""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    model_name = f"{model_type}_detection.onnx"
+    
+    search_paths = [
+        os.path.join(project_root, "models", model_name),
+        os.path.join("/app/models", model_name),
+        os.path.join(project_root, model_name),
+    ]
+    
+    for path in search_paths:
+        if os.path.exists(path):
+            return path
+    
+    logger.error(f"Model not found: {model_name}")
+    logger.error(f"Searched: {search_paths}")
+    return search_paths[0]
+
 
 def main():
     """Main entry point for AI worker."""
-    logger.info("Starting AI Worker...")
+    model_type = os.getenv("WORKER_MODEL_TYPE", "weapon")
     
-    # Load config from environment
+    logger.info(f"Starting AI Worker ({model_type})...")
+    
+    model_path = find_model_path(model_type)
+    input_queue = MODEL_QUEUE_MAP.get(model_type, "vg:critical")
+    
+    logger.info(f"Model path: {model_path}")
+    logger.info(f"Input queue: {input_queue}")
+    
     config = WorkerConfig(
+        model_type=model_type,
+        redis_input_queue=input_queue,
+        onnx_model_path=model_path,
         redis_host=os.getenv("REDIS_HOST", "localhost"),
         redis_port=int(os.getenv("REDIS_PORT", "6379")),
-        model_type=os.getenv("WORKER_MODEL_TYPE", "weapon"),
+        confidence_threshold=float(os.getenv("WORKER_CONFIDENCE_THRESHOLD", "0.40")),
     )
     
-    # Setup signal handlers
+    worker = None
+
     def shutdown(signum, frame):
         logger.info("Received shutdown signal, stopping worker...")
-        stop_worker()
+        if worker:
+            stop_worker(worker)
         sys.exit(0)
     
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     
     try:
-        # Start worker
-        start_worker(config)
+        worker = start_worker(config)
         
-        # Keep running
         logger.info(f"AI Worker ({config.model_type}) running. Press Ctrl+C to stop.")
         signal.pause()
         

@@ -14,8 +14,8 @@ from ..config import CameraConfig, RedisConfig, BufferConfig, RetryConfig, Share
 from ..capture.rtsp_handler import RTSPHandler
 from ..capture.frame_grabber import FrameGrabber
 from ..detection.motion_detector import MotionDetector
-from ..queue.redis_producer import RedisProducer
-from ..queue.task_models import TaskMetadata
+from ..redis_queue.redis_producer import RedisProducer
+from ..redis_queue.task_models import TaskMetadata
 from ..storage.shared_memory_impl import SharedMemoryImpl
 from ..utils.logging import setup_logging
 
@@ -222,6 +222,9 @@ class CameraProcess:
         
         consecutive_failures = 0
         max_consecutive_failures = 10
+        frames_processed = 0
+        last_heartbeat = time.time()
+        heartbeat_interval_sec = 30.0
         
         while not self.stop_event.is_set():
             try:
@@ -261,15 +264,34 @@ class CameraProcess:
                 # Mark frame as captured
                 self.frame_grabber.mark_captured()
                 
-                # Run motion detection
-                has_motion = self.motion_detector.detect(frame)
+                # Run motion detection (only if enabled)
+                if hasattr(self.camera_config, 'motion_enabled') and self.camera_config.motion_enabled:
+                    has_motion = self.motion_detector.detect(frame)
+                    
+                    if not has_motion:
+                        # No motion, skip frame
+                        continue
                 
-                if not has_motion:
-                    # No motion, skip frame
-                    continue
-                
-                # Motion detected - process frame
+                # Motion detected (or motion detection disabled) - process frame
                 self._process_frame(frame)
+                frames_processed += 1
+                
+                # Log progress every 10 frames at INFO level
+                if frames_processed % 10 == 0:
+                    self.logger.info(
+                        f"Capture loop progress: {frames_processed} frames processed",
+                        extra={"frames_processed": frames_processed}
+                    )
+
+                if time.time() - last_heartbeat >= heartbeat_interval_sec:
+                    self.logger.info(
+                        "Camera heartbeat",
+                        extra={
+                            "frames_processed": frames_processed,
+                            "consecutive_failures": consecutive_failures
+                        }
+                    )
+                    last_heartbeat = time.time()
                 
             except KeyboardInterrupt:
                 self.logger.info("Received keyboard interrupt")
@@ -287,11 +309,14 @@ class CameraProcess:
                 
                 time.sleep(1.0)
         
-        self.logger.info("Capture loop ended")
+        self.logger.info(f"Capture loop ended after {frames_processed} frames")
     
     def _process_frame(self, frame) -> None:
         """
         Process frame with motion detected.
+        
+        Publishes to ALL priority queues so each worker model
+        (weapon/fire/fall) processes every frame.
         
         Args:
             frame: Frame to process
@@ -303,20 +328,19 @@ class CameraProcess:
             # Generate frame ID
             frame_id = TaskMetadata.generate_frame_id(self.camera_config.camera_id)
             
-            # Create task metadata
-            task = TaskMetadata(
-                camera_id=self.camera_config.camera_id,
-                frame_id=frame_id,
-                shared_memory_key=shared_memory_key,
-                timestamp=time.time(),
-                priority="medium"  # Default operational priority
-            )
-            
-            # Enqueue to Redis
-            self.redis_producer.enqueue(task)
+            # Publish to ALL queues so each worker model gets the frame
+            for priority in ["critical", "high", "medium"]:
+                task = TaskMetadata(
+                    camera_id=self.camera_config.camera_id,
+                    frame_id=frame_id,
+                    shared_memory_key=shared_memory_key,
+                    timestamp=time.time(),
+                    priority=priority
+                )
+                self.redis_producer.enqueue(task)
             
             self.logger.debug(
-                f"Frame processed and enqueued",
+                f"Frame processed and enqueued to all queues",
                 extra={
                     "frame_id": frame_id,
                     "shared_memory_key": shared_memory_key
@@ -347,9 +371,11 @@ class CameraProcess:
         if self.redis_producer:
             self.redis_producer.disconnect()
         
-        # Cleanup shared memory
-        if self.shared_memory:
-            self.shared_memory.cleanup_all()
+        # NOTE: Do NOT cleanup shared frames here!
+        # Workers may still need frame files for tasks already in the queue.
+        # Frame files sit on tmpfs and are cleaned on container restart.
+        # if self.shared_memory:
+        #     self.shared_memory.cleanup_all()
         
         # Log final statistics
         if self.frame_grabber:

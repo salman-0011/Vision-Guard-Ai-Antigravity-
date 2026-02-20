@@ -67,13 +67,34 @@ class RuleEngine:
             Event if classification successful, None otherwise
         """
         self.classifications_run += 1
+
+        def normalize_confidence(raw_confidence: float) -> float:
+            confidence = float(raw_confidence)
+            if confidence > 1.0:
+                confidence = confidence / 100.0
+            if not (0.0 <= confidence <= 1.0):
+                raise ValueError(
+                    f"[CONFIDENCE SCALE ERROR] Invalid confidence value: {confidence}"
+                )
+            return confidence
         
         # PRIORITY 1: Weapon Detection (IMMEDIATE CRITICAL)
         # REFINEMENT: Weapon short-circuits correlation window
         if frame_state.has_weapon():
             weapon_result = frame_state.weapon_result
             
-            if weapon_result.confidence >= self.config.weapon_confidence_threshold:
+            # Defensive normalization safeguard
+            confidence = normalize_confidence(weapon_result.confidence)
+            
+            if confidence >= self.config.weapon_confidence_threshold:
+                self.logger.debug(
+                    "Weapon threshold passed",
+                    extra={
+                        "confidence": confidence,
+                        "threshold": self.config.weapon_confidence_threshold
+                    }
+                )
+                
                 self.weapon_events += 1
                 
                 event = Event(
@@ -83,7 +104,7 @@ class RuleEngine:
                     camera_id=frame_state.camera_id,
                     frame_id=frame_state.frame_id,
                     timestamp=weapon_result.timestamp,
-                    confidence=weapon_result.confidence,
+                    confidence=confidence,  # Use normalized confidence
                     bbox=weapon_result.bbox,
                     model_type="weapon",
                     correlation_age_ms=frame_state.get_age_ms()
@@ -94,7 +115,7 @@ class RuleEngine:
                     extra={
                         "frame_id": frame_state.frame_id,
                         "camera_id": frame_state.camera_id,
-                        "confidence": weapon_result.confidence,
+                        "confidence": confidence,  # Use normalized confidence
                         "age_ms": frame_state.get_age_ms()
                     }
                 )
@@ -105,8 +126,11 @@ class RuleEngine:
         # REFINEMENT: Check fire_seen_count for persistence
         if frame_state.has_fire():
             fire_result = frame_state.fire_result
-            
-            if (fire_result.confidence >= self.config.fire_confidence_threshold and
+
+            # Defensive normalization safeguard
+            confidence = normalize_confidence(fire_result.confidence)
+
+            if (confidence >= self.config.fire_confidence_threshold and
                 frame_state.fire_seen_count >= self.config.fire_min_frames):
                 
                 self.fire_events += 1
@@ -118,7 +142,7 @@ class RuleEngine:
                     camera_id=frame_state.camera_id,
                     frame_id=frame_state.frame_id,
                     timestamp=fire_result.timestamp,
-                    confidence=fire_result.confidence,
+                    confidence=confidence,
                     bbox=fire_result.bbox,
                     model_type="fire",
                     correlation_age_ms=frame_state.get_age_ms()
@@ -129,7 +153,7 @@ class RuleEngine:
                     extra={
                         "frame_id": frame_state.frame_id,
                         "camera_id": frame_state.camera_id,
-                        "confidence": fire_result.confidence,
+                        "confidence": confidence,
                         "fire_seen_count": frame_state.fire_seen_count,
                         "age_ms": frame_state.get_age_ms()
                     }
@@ -140,8 +164,11 @@ class RuleEngine:
         # PRIORITY 3: Fall Detection (MEDIUM - requires temporal confirmation)
         if frame_state.has_fall():
             fall_result = frame_state.fall_result
-            
-            if fall_result.confidence >= self.config.fall_confidence_threshold:
+
+            # Defensive normalization safeguard
+            confidence = normalize_confidence(fall_result.confidence)
+
+            if confidence >= self.config.fall_confidence_threshold:
                 self.fall_events += 1
                 
                 event = Event(
@@ -151,7 +178,7 @@ class RuleEngine:
                     camera_id=frame_state.camera_id,
                     frame_id=frame_state.frame_id,
                     timestamp=fall_result.timestamp,
-                    confidence=fall_result.confidence,
+                    confidence=confidence,
                     bbox=fall_result.bbox,
                     model_type="fall",
                     correlation_age_ms=frame_state.get_age_ms()
@@ -162,7 +189,7 @@ class RuleEngine:
                     extra={
                         "frame_id": frame_state.frame_id,
                         "camera_id": frame_state.camera_id,
-                        "confidence": fall_result.confidence,
+                        "confidence": confidence,
                         "age_ms": frame_state.get_age_ms()
                     }
                 )

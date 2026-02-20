@@ -25,10 +25,10 @@ class WorkerConfig(BaseModel):
     )
     onnx_model_path: str = Field(..., description="Path to ONNX model file")
     confidence_threshold: float = Field(
-        default=0.75,
+        default=0.40,
         ge=0.0,
         le=1.0,
-        description="Minimum confidence threshold for results"
+        description="Minimum confidence threshold for results (0-1 normalized scale)"
     )
     
     # Redis configuration
@@ -150,6 +150,9 @@ class ResultMetadata(BaseModel):
         }
         
         if self.bbox is not None:
-            result["bbox"] = self.bbox
+            # Redis XADD requires scalar types - serialize list to JSON string
+            import json
+            result["bbox"] = json.dumps(self.bbox)
         
         return result
+

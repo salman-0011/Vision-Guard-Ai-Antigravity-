@@ -66,17 +66,24 @@ def parse_event(event_id: str, raw_data: Dict[str, Any]) -> ParsedEvent:
     
     # Extract with safe defaults
     camera_id = raw_data.get("camera_id", "unknown")
-    event_type = raw_data.get("event_type", raw_data.get("type", "unknown"))
+    # Worker publishes 'model' field, not 'event_type'
+    event_type = raw_data.get("event_type", raw_data.get("model", raw_data.get("type", "unknown")))
     
     # Priority / severity
     priority = raw_data.get("priority", raw_data.get("severity", "MEDIUM"))
     if isinstance(priority, str):
         priority = priority.upper()
     
-    # Confidence
+    # Confidence - normalize to 0-1 range if needed
     confidence = 0.0
     try:
-        confidence = float(raw_data.get("confidence", 0))
+        conf_raw = float(raw_data.get("confidence", 0))
+        # If confidence is > 1, it's likely a raw score that needs normalization
+        # Model outputs values like 35-50, should be 0.35-0.50
+        if conf_raw > 1.0:
+            confidence = conf_raw / 100.0
+        else:
+            confidence = conf_raw
     except:
         pass
     

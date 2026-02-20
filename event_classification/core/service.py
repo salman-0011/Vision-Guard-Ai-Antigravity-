@@ -181,8 +181,8 @@ class ECSService:
             if self.config.resume_from_latest:
                 self.stream_consumer.set_start_id("$")  # Start from latest
             else:
-                # TODO: Load last processed ID from persistent storage
-                self.stream_consumer.set_start_id("$")
+                # Read from beginning to process all existing events
+                self.stream_consumer.set_start_id("0")  # Start from first message
             
             # Initialize cleanup manager (AUTHORITATIVE)
             self.cleanup_manager = CleanupManager()
@@ -192,7 +192,12 @@ class ECSService:
                 self.alert_dispatcher = AlertDispatcher()
             
             if self.config.enable_database:
-                self.database_writer = DatabaseWriter()
+                self.database_writer = DatabaseWriter(
+                    enabled=True,
+                    db_path=self.config.database_path,
+                    batch_size=self.config.database_batch_size,
+                    model_version=self.config.model_version
+                )
             
             if self.config.enable_frontend:
                 self.frontend_publisher = FrontendPublisher()
@@ -210,6 +215,9 @@ class ECSService:
     def _classification_loop(self) -> None:
         """Main classification loop."""
         self.logger.info("Starting classification loop")
+
+        last_heartbeat = time.time()
+        heartbeat_interval_sec = 30.0
         
         while not self.stop_event.is_set():
             try:
@@ -217,6 +225,16 @@ class ECSService:
                 messages = self.stream_consumer.consume()
                 
                 for msg in messages:
+                    self.logger.debug(
+                        "ECS raw Redis message",
+                        extra={
+                            "camera_id": msg.camera_id,
+                            "model_type": msg.model_type,
+                            "confidence": msg.confidence,
+                            "frame_id": msg.frame_id
+                        }
+                    )
+                    
                     # 2. Add result to frame buffer
                     ai_result = AIResult(
                         model_type=msg.model_type,
@@ -295,6 +313,16 @@ class ECSService:
                     
                     # Remove from buffer
                     self.frame_buffer.remove_frame(frame_state.frame_id)
+
+                if time.time() - last_heartbeat >= heartbeat_interval_sec:
+                    self.logger.info(
+                        "ECS heartbeat",
+                        extra={
+                            "buffer_size": self.frame_buffer.get_buffer_size(),
+                            "messages_consumed": self.stream_consumer.messages_consumed
+                        }
+                    )
+                    last_heartbeat = time.time()
                 
             except KeyboardInterrupt:
                 self.logger.info("Received keyboard interrupt")

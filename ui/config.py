@@ -13,9 +13,9 @@ from dataclasses import dataclass
 class UIConfig:
     """Configuration for Debug UI."""
     
-    # Redis connection (READ-ONLY)
+    # Redis connection (READ-ONLY) - Port 6380 connects to Docker Redis
     redis_host: str = "localhost"
-    redis_port: int = 6379
+    redis_port: int = 6380
     redis_db: int = 0
     redis_password: str = ""
     
@@ -28,6 +28,9 @@ class UIConfig:
     refresh_interval_sec: float = 1.5
     max_cached_events: int = 100
     max_cached_frames: int = 50
+
+    # Backend API (for DB stats)
+    backend_base_url: str = "http://localhost:8000"
     
     # Display
     page_title: str = "VisionGuard AI - Debug UI"
@@ -38,7 +41,7 @@ class UIConfig:
         """Load configuration from environment variables."""
         return cls(
             redis_host=os.getenv("REDIS_HOST", "localhost"),
-            redis_port=int(os.getenv("REDIS_PORT", "6379")),
+            redis_port=int(os.getenv("REDIS_PORT", "6380")),
             redis_db=int(os.getenv("REDIS_DB", "0")),
             redis_password=os.getenv("REDIS_PASSWORD", ""),
             stream_name=os.getenv("VG_STREAM_NAME", "vg:ai:results"),
@@ -47,6 +50,7 @@ class UIConfig:
             refresh_interval_sec=float(os.getenv("VG_REFRESH_SEC", "1.5")),
             max_cached_events=int(os.getenv("VG_MAX_EVENTS", "100")),
             max_cached_frames=int(os.getenv("VG_MAX_FRAMES", "50")),
+            backend_base_url=os.getenv("VG_BACKEND_URL", "http://localhost:8000"),
         )
 
 

@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import time
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime
 from collections import deque
 from typing import Dict, Any, Optional
@@ -49,6 +52,8 @@ if "selected_event" not in st.session_state:
     st.session_state.selected_event = None
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = time.time()
+if "initial_load_done" not in st.session_state:
+    st.session_state.initial_load_done = False
 
 
 # ============================================================
@@ -114,6 +119,33 @@ def get_health_status() -> Dict[str, Any]:
     }
 
 
+def get_db_event_count() -> Optional[int]:
+    """Fetch total events count from backend DB stats endpoint."""
+    base_url = config.backend_base_url.rstrip("/")
+    url = f"{base_url}/events/stats"
+
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            payload = json.load(response)
+        total = payload.get("total_events")
+        return int(total) if total is not None else None
+    except Exception:
+        return None
+
+
+def get_pipeline_metrics() -> Dict[str, Any]:
+    """Get pipeline metrics for frame lifecycle tracking."""
+    reader = get_reader()
+    queue_lengths = reader.get_queue_lengths()
+    total_queue = sum(queue_lengths.values())
+
+    return {
+        "task_queue": queue_lengths.get("vg:critical", 0),
+        "queue_length": total_queue,
+        "db_events": get_db_event_count()
+    }
+
+
 def render_event_row(event: ParsedEvent, index: int):
     """Render a single event row in the timeline."""
     priority_class = f"event-{event.priority.lower()}"
@@ -140,15 +172,34 @@ def render_event_row(event: ParsedEvent, index: int):
 # Main Layout
 # ============================================================
 def main():
+    # ========== INITIAL LOAD ==========
+    # Fetch events on first page load
+    if not st.session_state.initial_load_done:
+        st.session_state.initial_load_done = True
+        fetch_new_events()
+    
     # Header
     st.title("🛡️ VisionGuard AI - Debug UI")
     st.caption("READ-ONLY • Temporary Debug Interface • Observes vg:ai:results stream")
+
+    # Pipeline metrics
+    st.subheader("📊 Pipeline Debug - Frame Flow")
+    pipeline = get_pipeline_metrics()
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Task Queue", pipeline["task_queue"])
+    metric_cols[1].metric("Queue Length", pipeline["queue_length"])
+    metric_cols[2].metric("Cached Events", len(st.session_state.events))
+    metric_cols[3].metric(
+        "Events in DB",
+        pipeline["db_events"] if pipeline["db_events"] is not None else "N/A"
+    )
     
     # --------------------------------------------------------
     # Sidebar - Health & Controls
     # --------------------------------------------------------
     with st.sidebar:
         st.header("⚙️ System Health")
+        st.caption("UI build: maintenance controls enabled")
         
         health = get_health_status()
         
@@ -177,10 +228,28 @@ def main():
         # Auto-refresh toggle
         auto_refresh = st.checkbox("Auto-refresh", value=True)
         refresh_rate = st.slider("Refresh interval (sec)", 1.0, 5.0, config.refresh_interval_sec)
+
+        st.divider()
+
+        st.subheader("🧹 Maintenance")
+        confirm_clear = st.checkbox("Confirm clear", value=False)
+        if st.button("Clear stream + queues + UI cache", use_container_width=True):
+            if not confirm_clear:
+                st.warning("Enable 'Confirm clear' to proceed.")
+            else:
+                reader = get_reader()
+                removed = reader.clear_stream_and_queues(
+                    queues=["vg:critical", "vg:high", "vg:medium"]
+                )
+                st.session_state.events.clear()
+                st.session_state.selected_event = None
+                st.session_state.last_refresh = time.time()
+                st.session_state.initial_load_done = True
+                st.toast(f"Cleared {removed} Redis keys and UI cache")
         
         st.divider()
-        st.caption("🔒 READ-ONLY MODE")
-        st.caption("No writes to Redis")
+        st.caption("🔒 Observer mode")
+        st.caption("Only the maintenance button clears Redis keys")
     
     # --------------------------------------------------------
     # Main Content - Two Column Layout

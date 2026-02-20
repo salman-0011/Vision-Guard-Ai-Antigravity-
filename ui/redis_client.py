@@ -18,18 +18,19 @@ logger = logging.getLogger(__name__)
 
 class RedisStreamReader:
     """
-    Read-only Redis stream consumer for debug UI.
+    Redis stream consumer for debug UI.
     
     Features:
     - Non-blocking XREAD
     - No stream ACK (pure observer)
+    - Optional admin clear for stream + task queues
     - Graceful disconnect handling
     - Connection health monitoring
     """
     
     def __init__(self):
         self._client: Optional[redis.Redis] = None
-        self._last_id = "$"  # Start from latest
+        self._last_id = "0"  # Start from beginning to read all existing events
         self._connected = False
         self._last_read_time: Optional[float] = None
         self._error_count = 0
@@ -81,6 +82,26 @@ class RedisStreamReader:
                 return []
         
         try:
+            # First-load: use XRANGE to fetch historical entries immediately
+            if self._last_id == "0":
+                messages = self._client.xrange(
+                    config.stream_name,
+                    min="0",
+                    max="+",
+                    count=config.read_count
+                )
+
+                if not messages:
+                    return []
+
+                events = []
+                for msg_id, data in messages:
+                    events.append((msg_id, data))
+                    self._last_id = msg_id
+
+                self._last_read_time = time.time()
+                return events
+
             # Non-blocking XREAD with short timeout
             result = self._client.xread(
                 {config.stream_name: self._last_id},
@@ -111,15 +132,6 @@ class RedisStreamReader:
             logger.error(f"Unexpected error reading stream: {e}")
             return []
     
-    def get_stream_length(self) -> int:
-        """Get approximate stream length."""
-        if not self._client or not self._connected:
-            return 0
-        try:
-            return self._client.xlen(config.stream_name)
-        except:
-            return 0
-    
     def get_health(self) -> Dict[str, Any]:
         """Get reader health status."""
         return {
@@ -129,6 +141,76 @@ class RedisStreamReader:
             "stream_length": self.get_stream_length() if self._connected else 0,
             "last_id": self._last_id
         }
+
+    def get_stream_length(self) -> int:
+        """Get number of results in the AI results stream."""
+        if not self._connected or not self._client:
+            return 0
+        try:
+            return self._client.xlen(config.stream_name)
+        except Exception as e:
+            logger.error(f"Error getting stream length: {e}")
+            return 0
+    
+    def get_task_queue_length(self) -> int:
+        """Get number of frames in task queue waiting for workers."""
+        if not self._connected or not self._client:
+            return 0
+        try:
+            # Camera publishes to vg:critical (not vg:tasks:critical!)
+            return self._client.llen("vg:critical")
+        except Exception as e:
+            logger.error(f"Error getting task queue length: {e}")
+            return 0
+
+    def get_queue_lengths(self) -> Dict[str, int]:
+        """Get per-queue lengths for worker tasks."""
+        if not self._client or not self._connected:
+            if not self.connect():
+                return {"vg:critical": 0, "vg:high": 0, "vg:medium": 0}
+
+        try:
+            return {
+                "vg:critical": self._client.llen("vg:critical"),
+                "vg:high": self._client.llen("vg:high"),
+                "vg:medium": self._client.llen("vg:medium"),
+            }
+        except Exception as e:
+            logger.error(f"Error getting queue lengths: {e}")
+            return {"vg:critical": 0, "vg:high": 0, "vg:medium": 0}
+
+    def get_total_queue_length(self) -> int:
+        """Get total number of frames waiting across queues."""
+        lengths = self.get_queue_lengths()
+        return sum(lengths.values())
+    
+    def reset_position(self, start_id: str = "0") -> None:
+        """Reset reader position for a fresh session."""
+        self._last_id = start_id
+        self._last_read_time = None
+
+    def clear_stream_and_queues(self, queues: Optional[List[str]] = None) -> int:
+        """
+        Delete the results stream and task queues.
+
+        Returns the number of keys removed.
+        """
+        if not self._client or not self._connected:
+            if not self.connect():
+                return 0
+
+        keys = [config.stream_name]
+        if queues:
+            keys.extend(queues)
+
+        try:
+            removed = self._client.delete(*keys)
+        except Exception as e:
+            logger.error(f"Error clearing stream/queues: {e}")
+            return 0
+
+        self.reset_position("0")
+        return int(removed)
     
     def close(self) -> None:
         """Close connection gracefully."""

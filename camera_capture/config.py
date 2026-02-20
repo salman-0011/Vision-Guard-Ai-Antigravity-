@@ -21,11 +21,16 @@ class CameraConfig(BaseModel):
         le=1.0,
         description="Motion detection threshold (0.0-1.0, percentage of frame with motion)"
     )
+    motion_enabled: bool = Field(
+        default=True,
+        description="Enable/disable motion detection for this camera"
+    )
     
     @validator('rtsp_url')
     def validate_rtsp_url(cls, v):
-        if not v.startswith(('rtsp://', 'rtmp://')):
-            raise ValueError('URL must start with rtsp:// or rtmp://')
+        # Allow RTSP/RTMP/HTTP/HTTPS URLs or local file paths
+        if not v.startswith(('rtsp://', 'rtmp://', 'http://', 'https://', '/', './')):
+            raise ValueError('URL must start with rtsp://, rtmp://, http://, https://, or be a valid file path')
         return v
 
 

@@ -37,7 +37,7 @@ class ECSConfig(BaseModel):
         description="Max messages to read per XREAD call"
     )
     resume_from_latest: bool = Field(
-        default=True,
+        default=False,
         description="On restart: True = start from latest, False = resume from last ID"
     )
     
@@ -55,15 +55,15 @@ class ECSConfig(BaseModel):
         description="Hard TTL for frames (absolute max)"
     )
     
-    # Classification thresholds
+    # Classification thresholds (tuned for actual model output range: 0.33-0.59 normalized)
     weapon_confidence_threshold: float = Field(
-        default=0.85,
+        default=0.50,
         ge=0.0,
         le=1.0,
         description="Min confidence for weapon detection (immediate classification)"
     )
     fire_confidence_threshold: float = Field(
-        default=0.75,
+        default=0.40,
         ge=0.0,
         le=1.0,
         description="Min confidence for fire detection"
@@ -74,7 +74,7 @@ class ECSConfig(BaseModel):
         description="Min frames required for fire persistence"
     )
     fall_confidence_threshold: float = Field(
-        default=0.80,
+        default=0.45,
         ge=0.0,
         le=1.0,
         description="Min confidence for fall detection"
@@ -89,8 +89,12 @@ class ECSConfig(BaseModel):
     alert_timeout_sec: float = Field(default=5.0, ge=1.0, le=30.0, description="Webhook timeout")
     
     enable_database: bool = Field(default=True, description="Enable database writing")
-    database_path: str = Field(default="./events.db", description="SQLite database path")
+    database_path: str = Field(
+        default=None,
+        description="SQLite database path (defaults to VG_DB_PATH env or /data/visionguard/events.db)"
+    )
     database_batch_size: int = Field(default=10, ge=1, le=100, description="Events per batch write")
+    model_version: str = Field(default="1.0.0", description="Model version for DB records")
     
     enable_frontend: bool = Field(default=True, description="Enable frontend publishing")
     frontend_queue_size: int = Field(default=1000, ge=100, le=10000, description="Max events in frontend queue")
