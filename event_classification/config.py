@@ -51,7 +51,7 @@ class ECSConfig(BaseModel):
     hard_ttl_seconds: float = Field(
         default=2.0,
         ge=1.0,
-        le=5.0,
+        le=30.0,
         description="Hard TTL for frames (absolute max)"
     )
     

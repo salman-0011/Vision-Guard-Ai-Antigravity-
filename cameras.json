@@ -7,8 +7,8 @@
             "fps": 5,
             "motion_threshold": 0.02,
             "priority": "critical",
-            "enabled": true,
-            "_comment": "Mobile IP Webcam - main stream"
+            "enabled": false,
+            "_comment": "Mobile IP Webcam - main stream (disabled: phone unreachable)"
         },
         {
             "id": "local_video_test",
@@ -17,7 +17,7 @@
             "fps": 5,
             "motion_threshold": 0.02,
             "priority": "medium",
-            "enabled": false,
+            "enabled": true,
             "_comment": "Enable this for local video testing"
         },
         {

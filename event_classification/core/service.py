@@ -294,7 +294,44 @@ class ECSService:
                         # 7. Remove from buffer
                         self.frame_buffer.remove_frame(msg.frame_id)
                 
-                # 8. Handle expired frames
+                # 8. Check mature frames whose correlation window has elapsed
+                # This is CRITICAL: without this, frames that received results
+                # in a previous iteration would never be classified (they'd just
+                # expire at TTL) because the classification check above only runs
+                # when a new message arrives for that specific frame.
+                frames_to_check = [
+                    fs for fs in list(self.frame_buffer.frames.values())
+                    if fs.get_age_ms() >= self.config.correlation_window_ms
+                ]
+                
+                for frame_state in frames_to_check:
+                    event = self.rule_engine.classify(frame_state)
+                    
+                    if event:
+                        self.logger.info(
+                            f"Classified mature frame: {event.event_type}",
+                            extra={
+                                "frame_id": frame_state.frame_id,
+                                "event_type": event.event_type,
+                                "confidence": event.confidence,
+                                "age_ms": frame_state.get_age_ms()
+                            }
+                        )
+                        
+                        if self.alert_dispatcher:
+                            self.alert_dispatcher.dispatch(event)
+                        
+                        if self.database_writer:
+                            self.database_writer.write(event)
+                        
+                        if self.frontend_publisher:
+                            self.frontend_publisher.publish(event)
+                    
+                    # Cleanup and remove regardless of classification result
+                    self.cleanup_manager.cleanup_frame(frame_state.shared_memory_key)
+                    self.frame_buffer.remove_frame(frame_state.frame_id)
+                
+                # 9. Handle expired frames (safety net for any remaining)
                 expired_frames = self.frame_buffer.get_expired_frames(
                     self.config.hard_ttl_seconds
                 )

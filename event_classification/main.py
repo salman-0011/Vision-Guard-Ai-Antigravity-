@@ -37,6 +37,8 @@ def main():
     fire_threshold = os.getenv("ECS_FIRE_THRESHOLD")
     fall_threshold = os.getenv("ECS_FALL_THRESHOLD")
     fire_min_frames = os.getenv("ECS_FIRE_MIN_FRAMES")
+    hard_ttl = os.getenv("ECS_HARD_TTL_SECONDS")
+    correlation_window = os.getenv("ECS_CORRELATION_WINDOW_MS")
 
     if weapon_threshold is not None:
         config_kwargs["weapon_confidence_threshold"] = float(weapon_threshold)
@@ -46,6 +48,10 @@ def main():
         config_kwargs["fall_confidence_threshold"] = float(fall_threshold)
     if fire_min_frames is not None:
         config_kwargs["fire_min_frames"] = int(fire_min_frames)
+    if hard_ttl is not None:
+        config_kwargs["hard_ttl_seconds"] = float(hard_ttl)
+    if correlation_window is not None:
+        config_kwargs["correlation_window_ms"] = int(correlation_window)
 
     config = ECSConfig(**config_kwargs)
 

@@ -50,17 +50,9 @@ class WorkerConfig(BaseModel):
         description="ONNX inter-op threads"
     )
     
-    # Model-specific preprocessing
+    # Model input size
     input_width: int = Field(default=640, ge=32, description="Model input width")
     input_height: int = Field(default=640, ge=32, description="Model input height")
-    normalize_mean: list = Field(
-        default=[0.485, 0.456, 0.406],
-        description="Normalization mean (ImageNet default)"
-    )
-    normalize_std: list = Field(
-        default=[0.229, 0.224, 0.225],
-        description="Normalization std (ImageNet default)"
-    )
     
     # Logging
     log_level: str = Field(default="INFO", description="Log level")
@@ -106,12 +98,6 @@ class WorkerConfig(BaseModel):
     def validate_log_format(cls, v):
         if v not in ['json', 'text']:
             raise ValueError('log_format must be "json" or "text"')
-        return v
-    
-    @validator('normalize_mean', 'normalize_std')
-    def validate_normalization(cls, v):
-        if len(v) != 3:
-            raise ValueError('Normalization values must have 3 elements (RGB)')
         return v
     
     class Config:

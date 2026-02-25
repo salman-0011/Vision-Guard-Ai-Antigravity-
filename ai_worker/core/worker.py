@@ -185,11 +185,9 @@ class AIWorker:
                 inter_op_num_threads=self.config.inter_op_num_threads
             )
             
-            # Initialize preprocessor
+            # Initialize preprocessor (YOLOv8: /255 only, no ImageNet normalization)
             self.preprocessor = Preprocessor(
-                target_size=(self.config.input_width, self.config.input_height),
-                normalize_mean=self.config.normalize_mean,
-                normalize_std=self.config.normalize_std
+                target_size=(self.config.input_width, self.config.input_height)
             )
             
             # Initialize inference engine
