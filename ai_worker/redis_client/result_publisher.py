@@ -101,7 +101,8 @@ class ResultPublisher:
             confidence=result.get("confidence", 0.0),
             bbox=result.get("bbox"),
             timestamp=task.timestamp,
-            inference_latency_ms=result.get("inference_latency_ms", 0.0)
+            inference_latency_ms=result.get("inference_latency_ms", 0.0),
+            detection_image=result.get("detection_image")
         )
         
         # Convert to dict

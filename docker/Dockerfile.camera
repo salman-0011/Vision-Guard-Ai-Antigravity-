@@ -26,7 +26,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install system dependencies (OpenCV needs some libs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
@@ -57,7 +57,7 @@ RUN mkdir -p /var/log/visionguard /data /dev/shm && \
     chown -R vguser:vguser /var/log/visionguard /data /app
 
 # Switch to non-root user
-USER vguser
+# USER vguser  # Commented out - running as root for multiprocessing
 
 # Signal handling
 STOPSIGNAL SIGTERM

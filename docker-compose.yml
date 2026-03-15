@@ -31,8 +31,8 @@ volumes:
     name: vg-app-data
   vg-logs:
     name: vg-logs
-  vg-shm:
-    name: vg-shared-memory
+  vg-frames:
+    name: vg-shared-frames
 
 services:
   # ============================================================
@@ -44,13 +44,14 @@ services:
     restart: unless-stopped
     networks:
       - visionguard
+    # Expose on port 6380 to avoid conflict with local Redis (6379)
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "6380:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -73,6 +74,7 @@ services:
     volumes:
       - vg-data:/data
       - vg-logs:/var/log/visionguard
+      - ./cameras.json:/app/cameras.json:ro
     environment:
       - VG_HOST=0.0.0.0
       - VG_PORT=8000
@@ -80,11 +82,12 @@ services:
       - VG_REDIS_PORT=6379
       - VG_ENVIRONMENT=${VG_ENVIRONMENT:-production}
       - VG_LOG_LEVEL=${VG_LOG_LEVEL:-INFO}
+      - VG_DB_PATH=/data/visionguard/events.db
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -100,20 +103,63 @@ services:
     container_name: vg-ecs
     restart: unless-stopped
     stop_grace_period: 20s
+    # SHM access via shared vg-shm volume + chmod 666 (no ipc:host - breaks semaphores for vguser)
     networks:
       - visionguard
     volumes:
       - vg-data:/data
       - vg-logs:/var/log/visionguard
-      - vg-shm:/dev/shm
+      - vg-frames:/shared-frames
     environment:
       - ECS_REDIS_HOST=redis
       - ECS_REDIS_PORT=6379
       - ECS_LOG_LEVEL=${ECS_LOG_LEVEL:-INFO}
-      - ECS_DATABASE_PATH=/data/events.db
+      - ECS_WEAPON_THRESHOLD=0.60
+      - ECS_FIRE_THRESHOLD=0.45
+      - ECS_FALL_THRESHOLD=0.75
+      - ECS_FIRE_MIN_DETECTIONS=3
+      - ECS_DATABASE_PATH=/data/visionguard/events.db
+      - VG_DB_PATH=/data/visionguard/events.db
+      - SHARED_FRAMES_DIR=/shared-frames
+      - ECS_HARD_TTL_SECONDS=15.0
+      - ECS_CORRELATION_WINDOW_MS=2000
+      - ECS_FIRE_PERSISTENCE_WINDOW=8.0
+      - ECS_WEAPON_COOLDOWN_SECONDS=30.0
+      - ECS_FIRE_COOLDOWN_SECONDS=60.0
+      - ECS_FALL_COOLDOWN_SECONDS=30.0
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, sys, redis; r=redis.Redis(host=os.getenv('ECS_REDIS_HOST','redis'), port=int(os.getenv('ECS_REDIS_PORT','6379'))); r.ping(); ok=False;
+
+            for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
+
+            \    try:
+
+            \        cmd=open(f'/proc/{pid}/cmdline','rb').read().decode('utf-8','ignore')
+
+            \        if 'event_classification.main' in cmd:
+
+            \            ok=True
+
+            \            break
+
+            \    except Exception:
+
+            \        pass
+
+            sys.exit(0 if ok else 1)"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     # CRITICAL: ECS is SINGLETON - enforce single replica
     deploy:
       replicas: 1
@@ -131,11 +177,13 @@ services:
     container_name: vg-camera
     restart: unless-stopped
     stop_grace_period: 15s
+    shm_size: 256m
+    ipc: host
     networks:
       - visionguard
     volumes:
       - vg-logs:/var/log/visionguard
-      - vg-shm:/dev/shm
+      - vg-frames:/shared-frames
       - ./test-video.mp4:/app/test-video.mp4:ro
       - ./cameras.json:/app/cameras.json:ro
     environment:
@@ -143,36 +191,233 @@ services:
       - REDIS_PORT=6379
       - CAMERA_CONFIG_PATH=/app/cameras.json
       - LOG_LEVEL=${CAMERA_LOG_LEVEL:-INFO}
+      - SHARED_FRAMES_DIR=/shared-frames
     depends_on:
       redis:
         condition: service_healthy
       backend:
         condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, sys, redis; r=redis.Redis(host=os.getenv('REDIS_HOST','redis'), port=int(os.getenv('REDIS_PORT','6379'))); r.ping(); ok=False;
+
+            for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
+
+            \    try:
+
+            \        cmd=open(f'/proc/{pid}/cmdline','rb').read().decode('utf-8','ignore')
+
+            \        if 'camera_capture.main' in cmd:
+
+            \            ok=True
+
+            \            break
+
+            \    except Exception:
+
+            \        pass
+
+            sys.exit(0 if ok else 1)"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   # ============================================================
-  # AI Workers - Inference (SCALABLE)
+  # AI Workers - Multi-Model Inference
   # ============================================================
-  worker:
+  # Three specialized workers for comprehensive event detection
+
+  worker-weapon:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
+    container_name: vg-worker-weapon
     restart: unless-stopped
     stop_grace_period: 35s
+    # SHM access via shared vg-shm volume + chmod 666 (no ipc:host - breaks semaphores for vguser)
     networks:
       - visionguard
     volumes:
+      - vg-data:/data
       - vg-logs:/var/log/visionguard
-      - vg-shm:/dev/shm:ro
+      - vg-frames:/shared-frames
+    tmpfs:
+      - /tmp:size=100M
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - WORKER_MODEL_TYPE=${WORKER_MODEL_TYPE:-weapon}
+      - WORKER_MODEL_TYPE=weapon
+      - WORKER_CONFIDENCE_THRESHOLD=0.40
       - ONNX_EXECUTION_PROVIDER=CPUExecutionProvider
       - LOG_LEVEL=${WORKER_LOG_LEVEL:-INFO}
+      - SHARED_FRAMES_DIR=/shared-frames
     depends_on:
       redis:
         condition: service_healthy
-    # Workers can be scaled: docker-compose up -d --scale worker=3
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, sys, redis; r=redis.Redis(host=os.getenv('REDIS_HOST','redis'), port=int(os.getenv('REDIS_PORT','6379'))); r.ping(); ok=False;
+
+            for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
+
+            \    try:
+
+            \        cmd=open(f'/proc/{pid}/cmdline','rb').read().decode('utf-8','ignore')
+
+            \        if 'ai_worker.main' in cmd:
+
+            \            ok=True
+
+            \            break
+
+            \    except Exception:
+
+            \        pass
+
+            sys.exit(0 if ok else 1)"
+        ]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  worker-fire:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: vg-worker-fire
+    restart: unless-stopped
+    stop_grace_period: 35s
+    # SHM access via shared vg-shm volume + chmod 666 (no ipc:host - breaks semaphores for vguser)
+    networks:
+      - visionguard
+    volumes:
+      - vg-data:/data
+      - vg-logs:/var/log/visionguard
+      - vg-frames:/shared-frames
+    tmpfs:
+      - /tmp:size=100M
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKER_MODEL_TYPE=fire
+      - WORKER_CONFIDENCE_THRESHOLD=0.25
+      - ONNX_EXECUTION_PROVIDER=CPUExecutionProvider
+      - LOG_LEVEL=${WORKER_LOG_LEVEL:-INFO}
+      - SHARED_FRAMES_DIR=/shared-frames
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, sys, redis; r=redis.Redis(host=os.getenv('REDIS_HOST','redis'), port=int(os.getenv('REDIS_PORT','6379'))); r.ping(); ok=False;
+
+            for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
+
+            \    try:
+
+            \        cmd=open(f'/proc/{pid}/cmdline','rb').read().decode('utf-8','ignore')
+
+            \        if 'ai_worker.main' in cmd:
+
+            \            ok=True
+
+            \            break
+
+            \    except Exception:
+
+            \        pass
+
+            sys.exit(0 if ok else 1)"
+        ]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  worker-fall:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: vg-worker-fall
+    restart: unless-stopped
+    stop_grace_period: 35s
+    # SHM access via shared vg-shm volume + chmod 666 (no ipc:host - breaks semaphores for vguser)
+    networks:
+      - visionguard
+    volumes:
+      - vg-data:/data
+      - vg-logs:/var/log/visionguard
+      - vg-frames:/shared-frames
+    tmpfs:
+      - /tmp:size=100M
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - WORKER_MODEL_TYPE=fall
+      - WORKER_CONFIDENCE_THRESHOLD=0.60
+      - ONNX_EXECUTION_PROVIDER=CPUExecutionProvider
+      - LOG_LEVEL=${WORKER_LOG_LEVEL:-INFO}
+      - SHARED_FRAMES_DIR=/shared-frames
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, sys, redis; r=redis.Redis(host=os.getenv('REDIS_HOST','redis'), port=int(os.getenv('REDIS_PORT','6379'))); r.ping(); ok=False;
+
+            for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
+
+            \    try:
+
+            \        cmd=open(f'/proc/{pid}/cmdline','rb').read().decode('utf-8','ignore')
+
+            \        if 'ai_worker.main' in cmd:
+
+            \            ok=True
+
+            \            break
+
+            \    except Exception:
+
+            \        pass
+
+            sys.exit(0 if ok else 1)"
+        ]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
     deploy:
       resources:
         limits:

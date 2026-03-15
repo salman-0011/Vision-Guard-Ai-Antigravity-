@@ -13,6 +13,7 @@ from typing import Optional
 from ..config import ECSConfig
 from ..buffer.frame_buffer import FrameBuffer
 from ..buffer.frame_state import AIResult
+from ..buffer.camera_history import CameraHistoryManager
 from ..classification.rule_engine import RuleEngine
 from ..redis_client.stream_consumer import StreamConsumer
 from ..cleanup.cleanup_manager import CleanupManager
@@ -60,6 +61,8 @@ class ECSService:
         self.alert_dispatcher: Optional[AlertDispatcher] = None
         self.database_writer: Optional[DatabaseWriter] = None
         self.frontend_publisher: Optional[FrontendPublisher] = None
+        # V2: Camera history manager
+        self.camera_history_manager: Optional[CameraHistoryManager] = None
     
     def start(self) -> bool:
         """
@@ -166,6 +169,15 @@ class ECSService:
             # Initialize rule engine
             self.rule_engine = RuleEngine(self.config)
             
+            # V2: Initialize camera history manager
+            self.camera_history_manager = CameraHistoryManager(
+                history_window_seconds=self.config.camera_history_window_sec
+            )
+            self.logger.info(
+                "CameraHistoryManager initialized",
+                extra={"window_sec": self.config.camera_history_window_sec}
+            )
+            
             # Initialize Redis stream consumer
             self.stream_consumer = StreamConsumer(
                 stream_name=self.config.input_stream,
@@ -181,8 +193,8 @@ class ECSService:
             if self.config.resume_from_latest:
                 self.stream_consumer.set_start_id("$")  # Start from latest
             else:
-                # TODO: Load last processed ID from persistent storage
-                self.stream_consumer.set_start_id("$")
+                # Read from beginning to process all existing events
+                self.stream_consumer.set_start_id("0")  # Start from first message
             
             # Initialize cleanup manager (AUTHORITATIVE)
             self.cleanup_manager = CleanupManager()
@@ -192,7 +204,12 @@ class ECSService:
                 self.alert_dispatcher = AlertDispatcher()
             
             if self.config.enable_database:
-                self.database_writer = DatabaseWriter()
+                self.database_writer = DatabaseWriter(
+                    enabled=True,
+                    db_path=self.config.database_path,
+                    batch_size=self.config.database_batch_size,
+                    model_version=self.config.model_version
+                )
             
             if self.config.enable_frontend:
                 self.frontend_publisher = FrontendPublisher()
@@ -209,7 +226,11 @@ class ECSService:
     
     def _classification_loop(self) -> None:
         """Main classification loop."""
-        self.logger.info("Starting classification loop")
+        self.logger.info("Starting classification loop (v2)")
+
+        last_heartbeat = time.time()
+        heartbeat_interval_sec = 30.0
+        last_classification_scan = time.time()
         
         while not self.stop_event.is_set():
             try:
@@ -217,6 +238,16 @@ class ECSService:
                 messages = self.stream_consumer.consume()
                 
                 for msg in messages:
+                    self.logger.debug(
+                        "ECS raw Redis message",
+                        extra={
+                            "camera_id": msg.camera_id,
+                            "model_type": msg.model_type,
+                            "confidence": msg.confidence,
+                            "frame_id": msg.frame_id
+                        }
+                    )
+                    
                     # 2. Add result to frame buffer
                     ai_result = AIResult(
                         model_type=msg.model_type,
@@ -234,18 +265,16 @@ class ECSService:
                     )
                     
                     # 3. Check if ready for classification
-                    # REFINEMENT: Weapon short-circuits correlation window
+                    # Weapon short-circuits correlation window
                     should_classify = False
                     
                     if self.rule_engine.should_classify_immediately(frame_state):
-                        # Weapon detected - classify immediately
                         should_classify = True
                         self.logger.debug(
                             f"Weapon detected - immediate classification",
                             extra={"frame_id": msg.frame_id}
                         )
                     elif frame_state.get_age_ms() >= self.config.correlation_window_ms:
-                        # Correlation window elapsed
                         should_classify = True
                         self.logger.debug(
                             f"Correlation window elapsed - classifying",
@@ -256,32 +285,107 @@ class ECSService:
                         )
                     
                     if should_classify:
-                        # 4. Classify
-                        event = self.rule_engine.classify(frame_state)
+                        # 4. Classify with camera history (v2)
+                        camera_history = self.camera_history_manager.get(
+                            frame_state.camera_id
+                        )
+                        frame_state.classification_attempted = True
+                        event = self.rule_engine.classify(
+                            frame_state, camera_history
+                        )
                         
                         if event:
-                            # 5. Dispatch outputs (async, non-blocking)
+                            # 5. Dispatch outputs
                             if self.alert_dispatcher:
                                 self.alert_dispatcher.dispatch(event)
-                            
                             if self.database_writer:
                                 self.database_writer.write(event)
-                            
                             if self.frontend_publisher:
                                 self.frontend_publisher.publish(event)
                         
-                        # 6. Cleanup shared memory (AUTHORITATIVE)
-                        self.cleanup_manager.cleanup_frame(frame_state.shared_memory_key)
-                        
+                        # 6. Cleanup shared memory
+                        self.cleanup_manager.cleanup_frame(
+                            frame_state.shared_memory_key
+                        )
                         # 7. Remove from buffer
                         self.frame_buffer.remove_frame(msg.frame_id)
                 
-                # 8. Handle expired frames
+                # 8. V2 Periodic classification scan
+                current_time = time.time()
+                if current_time - last_classification_scan >= 1.0:
+                    aged_frames = (
+                        self.frame_buffer.get_frames_needing_classification(
+                            self.config.correlation_window_ms
+                        )
+                    )
+                    
+                    for frame_state in aged_frames:
+                        frame_state.classification_attempted = True
+                        camera_history = self.camera_history_manager.get(
+                            frame_state.camera_id
+                        )
+                        event = self.rule_engine.classify(
+                            frame_state, camera_history
+                        )
+                        
+                        if event:
+                            self.logger.info(
+                                f"Classified aged frame: {event.event_type}",
+                                extra={
+                                    "frame_id": frame_state.frame_id,
+                                    "event_type": event.event_type,
+                                    "confidence": event.confidence,
+                                    "age_ms": frame_state.get_age_ms()
+                                }
+                            )
+                            if self.alert_dispatcher:
+                                self.alert_dispatcher.dispatch(event)
+                            if self.database_writer:
+                                self.database_writer.write(event)
+                            if self.frontend_publisher:
+                                self.frontend_publisher.publish(event)
+                        
+                        self.cleanup_manager.cleanup_frame(
+                            frame_state.shared_memory_key
+                        )
+                        self.frame_buffer.remove_frame(
+                            frame_state.frame_id
+                        )
+                    
+                    last_classification_scan = current_time
+                
+                # 9. Handle expired frames (safety net)
                 expired_frames = self.frame_buffer.get_expired_frames(
                     self.config.hard_ttl_seconds
                 )
                 
                 for frame_state in expired_frames:
+                    # Force classify before expiry
+                    if not frame_state.classification_attempted:
+                        frame_state.classification_attempted = True
+                        frame_state.classification_reason = "ttl_expiry"
+                        camera_history = self.camera_history_manager.get(
+                            frame_state.camera_id
+                        )
+                        event = self.rule_engine.classify(
+                            frame_state, camera_history
+                        )
+                        if event:
+                            self.logger.info(
+                                f"TTL expiry classification: {event.event_type}",
+                                extra={
+                                    "frame_id": frame_state.frame_id,
+                                    "event_type": event.event_type,
+                                    "confidence": event.confidence,
+                                }
+                            )
+                            if self.alert_dispatcher:
+                                self.alert_dispatcher.dispatch(event)
+                            if self.database_writer:
+                                self.database_writer.write(event)
+                            if self.frontend_publisher:
+                                self.frontend_publisher.publish(event)
+                    
                     self.logger.warning(
                         f"Frame expired (TTL)",
                         extra={
@@ -289,12 +393,22 @@ class ECSService:
                             "age_ms": frame_state.get_age_ms()
                         }
                     )
-                    
-                    # Cleanup even if not classified
-                    self.cleanup_manager.cleanup_frame(frame_state.shared_memory_key)
-                    
-                    # Remove from buffer
+                    self.cleanup_manager.cleanup_frame(
+                        frame_state.shared_memory_key
+                    )
                     self.frame_buffer.remove_frame(frame_state.frame_id)
+
+                if time.time() - last_heartbeat >= heartbeat_interval_sec:
+                    self.logger.info(
+                        "ECS v2 heartbeat",
+                        extra={
+                            "buffer_size": self.frame_buffer.get_buffer_size(),
+                            "messages_consumed": self.stream_consumer.messages_consumed,
+                            "cameras_tracked": self.camera_history_manager.camera_count(),
+                            "rule_engine_stats": self.rule_engine.get_stats()
+                        }
+                    )
+                    last_heartbeat = time.time()
                 
             except KeyboardInterrupt:
                 self.logger.info("Received keyboard interrupt")

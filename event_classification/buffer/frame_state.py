@@ -51,9 +51,9 @@ class FrameState:
     first_seen_ts: float = field(default_factory=time.time)
     last_update_ts: float = field(default_factory=time.time)
     
-    # REFINEMENT: Fire persistence tracking
-    fire_seen_count: int = 0  # Track how many times fire was detected
-    fire_first_seen_ts: Optional[float] = None  # When fire was first seen
+    # V2: Classification trigger tracking
+    classification_attempted: bool = False
+    classification_reason: Optional[str] = None  # weapon_immediate, window_elapsed, ttl_expiry, no_detection
     
     def add_result(self, result: AIResult) -> None:
         """
@@ -66,10 +66,6 @@ class FrameState:
             self.weapon_result = result
         elif result.model_type == "fire":
             self.fire_result = result
-            # REFINEMENT: Track fire persistence
-            self.fire_seen_count += 1
-            if self.fire_first_seen_ts is None:
-                self.fire_first_seen_ts = result.timestamp
         elif result.model_type == "fall":
             self.fall_result = result
         
@@ -127,8 +123,8 @@ class FrameState:
         if self.weapon_result:
             results.append(f"weapon:{self.weapon_result.confidence:.2f}")
         if self.fire_result:
-            results.append(f"fire:{self.fire_result.confidence:.2f}(x{self.fire_seen_count})")
+            results.append(f"fire:{self.fire_result.confidence:.2f}")
         if self.fall_result:
             results.append(f"fall:{self.fall_result.confidence:.2f}")
-        
-        return f"FrameState({self.frame_id}, age={self.get_age_ms():.0f}ms, {', '.join(results)})"
+        reason = f", reason={self.classification_reason}" if self.classification_reason else ""
+        return f"FrameState({self.frame_id}, age={self.get_age_ms():.0f}ms, {', '.join(results)}{reason})"

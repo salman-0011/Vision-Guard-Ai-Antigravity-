@@ -27,16 +27,53 @@ def main():
     logger.info("Starting Event Classification Service (SINGLETON)...")
     
     # Load config from environment
-    config = ECSConfig(
-        redis_host=os.getenv("ECS_REDIS_HOST", "localhost"),
-        redis_port=int(os.getenv("ECS_REDIS_PORT", "6379")),
-        database_path=os.getenv("ECS_DATABASE_PATH", "/data/events.db"),
-    )
+    config_kwargs = {
+        "redis_host": os.getenv("ECS_REDIS_HOST", "localhost"),
+        "redis_port": int(os.getenv("ECS_REDIS_PORT", "6379")),
+        "database_path": os.getenv("ECS_DATABASE_PATH", "/data/events.db"),
+    }
+
+    weapon_threshold = os.getenv("ECS_WEAPON_THRESHOLD")
+    fire_threshold = os.getenv("ECS_FIRE_THRESHOLD")
+    fall_threshold = os.getenv("ECS_FALL_THRESHOLD")
+    fire_min_detections = os.getenv("ECS_FIRE_MIN_DETECTIONS")
+    hard_ttl = os.getenv("ECS_HARD_TTL_SECONDS")
+    correlation_window = os.getenv("ECS_CORRELATION_WINDOW_MS")
+    fire_persistence_window = os.getenv("ECS_FIRE_PERSISTENCE_WINDOW")
+    weapon_cooldown = os.getenv("ECS_WEAPON_COOLDOWN_SECONDS")
+    fire_cooldown = os.getenv("ECS_FIRE_COOLDOWN_SECONDS")
+    fall_cooldown = os.getenv("ECS_FALL_COOLDOWN_SECONDS")
+
+    if weapon_threshold is not None:
+        config_kwargs["weapon_confidence_threshold"] = float(weapon_threshold)
+    if fire_threshold is not None:
+        config_kwargs["fire_confidence_threshold"] = float(fire_threshold)
+    if fall_threshold is not None:
+        config_kwargs["fall_confidence_threshold"] = float(fall_threshold)
+    if fire_min_detections is not None:
+        config_kwargs["fire_min_detections"] = int(fire_min_detections)
+    if hard_ttl is not None:
+        config_kwargs["hard_ttl_seconds"] = float(hard_ttl)
+    if correlation_window is not None:
+        config_kwargs["correlation_window_ms"] = int(correlation_window)
+    if fire_persistence_window is not None:
+        config_kwargs["fire_persistence_window_sec"] = float(fire_persistence_window)
+    if weapon_cooldown is not None:
+        config_kwargs["weapon_cooldown_seconds"] = float(weapon_cooldown)
+    if fire_cooldown is not None:
+        config_kwargs["fire_cooldown_seconds"] = float(fire_cooldown)
+    if fall_cooldown is not None:
+        config_kwargs["fall_cooldown_seconds"] = float(fall_cooldown)
+
+    config = ECSConfig(**config_kwargs)
+
+    ecs_service = None
     
     # Setup signal handlers
     def shutdown(signum, frame):
         logger.info("Received shutdown signal, stopping ECS...")
-        stop_ecs()
+        if ecs_service:
+            stop_ecs(ecs_service)
         sys.exit(0)
     
     signal.signal(signal.SIGTERM, shutdown)
@@ -44,7 +81,7 @@ def main():
     
     try:
         # Start ECS
-        start_ecs(config)
+        ecs_service = start_ecs(config)
         
         # Keep running
         logger.info("ECS running. Press Ctrl+C to stop.")

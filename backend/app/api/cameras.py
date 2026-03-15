@@ -2,6 +2,7 @@
 VisionGuard AI - Camera API Routes
 
 Endpoints for camera registration and control.
+GET  /cameras           ← NEW: merged camera list from cameras.json + runtime status
 POST /cameras/register
 POST /cameras/{id}/start
 POST /cameras/{id}/stop
@@ -10,7 +11,11 @@ GET  /cameras/{id}/status
 DELETE /cameras/{id}
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Path
+import json
+from pathlib import Path
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException, Path as PathParam
 
 from app.services.camera_manager import get_camera_manager, CameraManager
 from app.models.cameras import (
@@ -23,6 +28,63 @@ from app.utils.logging import get_logger
 
 router = APIRouter(prefix="/cameras", tags=["Cameras"])
 logger = get_logger(__name__)
+
+# Path to cameras.json (mounted at /app/cameras.json in Docker)
+CAMERAS_JSON_PATH = Path("/app/cameras.json")
+
+
+@router.get("")
+async def list_cameras(
+    camera_manager: CameraManager = Depends(get_camera_manager)
+) -> List[dict]:
+    """
+    Get all cameras from cameras.json merged with runtime status.
+    
+    Returns camera config (name, source, fps, priority, enabled) merged
+    with runtime state (running/stopped/unknown, pid).
+    """
+    # Read cameras.json
+    cameras_config = []
+    try:
+        if CAMERAS_JSON_PATH.exists():
+            with open(CAMERAS_JSON_PATH, "r") as f:
+                data = json.load(f)
+                cameras_config = data.get("cameras", [])
+        else:
+            logger.warning(f"cameras.json not found at {CAMERAS_JSON_PATH}")
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"Failed to read cameras.json: {e}")
+        return []
+
+    # Get runtime status from camera_manager
+    runtime_status = camera_manager.get_all_status()
+    runtime_cameras = runtime_status.get("cameras", {})
+
+    # Merge config with runtime status
+    result = []
+    for cam in cameras_config:
+        cam_id = cam.get("id", "")
+        runtime = runtime_cameras.get(cam_id)
+
+        if runtime is not None:
+            status = "running" if runtime.get("is_running") else "stopped"
+            pid = runtime.get("pid")
+        else:
+            status = "unknown"
+            pid = None
+
+        result.append({
+            "id": cam_id,
+            "name": cam.get("name", cam_id),
+            "source": cam.get("source", ""),
+            "fps": cam.get("fps", 5),
+            "priority": cam.get("priority", "medium"),
+            "enabled": cam.get("enabled", True),
+            "status": status,
+            "pid": pid,
+        })
+
+    return result
 
 
 @router.post("/register", response_model=CameraResponse)
@@ -57,7 +119,7 @@ async def register_camera(
 
 @router.delete("/{camera_id}", response_model=CameraResponse)
 async def unregister_camera(
-    camera_id: str = Path(..., description="Camera ID to unregister"),
+    camera_id: str = PathParam(..., description="Camera ID to unregister"),
     camera_manager: CameraManager = Depends(get_camera_manager)
 ) -> CameraResponse:
     """
@@ -80,7 +142,7 @@ async def unregister_camera(
 
 @router.post("/{camera_id}/start", response_model=CameraResponse)
 async def start_camera(
-    camera_id: str = Path(..., description="Camera ID to start"),
+    camera_id: str = PathParam(..., description="Camera ID to start"),
     camera_manager: CameraManager = Depends(get_camera_manager)
 ) -> CameraResponse:
     """
@@ -104,7 +166,7 @@ async def start_camera(
 
 @router.post("/{camera_id}/stop", response_model=CameraResponse)
 async def stop_camera(
-    camera_id: str = Path(..., description="Camera ID to stop"),
+    camera_id: str = PathParam(..., description="Camera ID to stop"),
     camera_manager: CameraManager = Depends(get_camera_manager)
 ) -> CameraResponse:
     """
@@ -173,7 +235,7 @@ async def get_all_cameras_status(
 
 @router.get("/{camera_id}/status")
 async def get_camera_status(
-    camera_id: str = Path(..., description="Camera ID"),
+    camera_id: str = PathParam(..., description="Camera ID"),
     camera_manager: CameraManager = Depends(get_camera_manager)
 ) -> dict:
     """

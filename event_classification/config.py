@@ -37,47 +37,81 @@ class ECSConfig(BaseModel):
         description="Max messages to read per XREAD call"
     )
     resume_from_latest: bool = Field(
-        default=True,
+        default=False,
         description="On restart: True = start from latest, False = resume from last ID"
     )
     
-    # Frame buffer configuration
+    # Frame buffer configuration (v2: widened for real inference latency)
     correlation_window_ms: int = Field(
-        default=400,
+        default=2000,
         ge=300,
-        le=500,
-        description="Correlation window for multi-model results (300-500ms)"
+        le=10000,
+        description="Correlation window for multi-model results (v2: 2000ms for 3-6s latency)"
     )
     hard_ttl_seconds: float = Field(
-        default=2.0,
+        default=15.0,
         ge=1.0,
-        le=5.0,
-        description="Hard TTL for frames (absolute max)"
+        le=60.0,
+        description="Hard TTL for frames (v2: 15s to survive p95 inference)"
     )
     
-    # Classification thresholds
+    # Classification thresholds (tuned for actual model output range: 0.33-0.59 normalized)
     weapon_confidence_threshold: float = Field(
-        default=0.85,
+        default=0.50,
         ge=0.0,
         le=1.0,
         description="Min confidence for weapon detection (immediate classification)"
     )
     fire_confidence_threshold: float = Field(
-        default=0.75,
+        default=0.40,
         ge=0.0,
         le=1.0,
         description="Min confidence for fire detection"
     )
-    fire_min_frames: int = Field(
-        default=2,
+    fire_min_detections: int = Field(
+        default=3,
         ge=1,
-        description="Min frames required for fire persistence"
+        description="Min fire detections in persistence window (v2: camera-level)"
+    )
+    fire_persistence_window_sec: float = Field(
+        default=8.0,
+        ge=1.0,
+        le=60.0,
+        description="Sliding window for fire persistence (seconds)"
     )
     fall_confidence_threshold: float = Field(
-        default=0.80,
+        default=0.45,
         ge=0.0,
         le=1.0,
         description="Min confidence for fall detection"
+    )
+    
+    # V2: Camera history
+    camera_history_window_sec: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+        description="How long to keep camera detection history"
+    )
+    
+    # V2: Event cooldown (deduplication)
+    weapon_cooldown_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=300.0,
+        description="Suppress duplicate weapon events for this duration"
+    )
+    fire_cooldown_seconds: float = Field(
+        default=60.0,
+        ge=0.0,
+        le=300.0,
+        description="Suppress duplicate fire events for this duration"
+    )
+    fall_cooldown_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        le=300.0,
+        description="Suppress duplicate fall events for this duration"
     )
     
     # Output configuration (all outputs are async, non-blocking)
@@ -89,8 +123,12 @@ class ECSConfig(BaseModel):
     alert_timeout_sec: float = Field(default=5.0, ge=1.0, le=30.0, description="Webhook timeout")
     
     enable_database: bool = Field(default=True, description="Enable database writing")
-    database_path: str = Field(default="./events.db", description="SQLite database path")
+    database_path: str = Field(
+        default=None,
+        description="SQLite database path (defaults to VG_DB_PATH env or /data/visionguard/events.db)"
+    )
     database_batch_size: int = Field(default=10, ge=1, le=100, description="Events per batch write")
+    model_version: str = Field(default="1.0.0", description="Model version for DB records")
     
     enable_frontend: bool = Field(default=True, description="Enable frontend publishing")
     frontend_queue_size: int = Field(default=1000, ge=100, le=10000, description="Max events in frontend queue")

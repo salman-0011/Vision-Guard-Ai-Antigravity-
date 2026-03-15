@@ -8,11 +8,11 @@ import sys
 import os
 import signal
 import logging
+import json
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from camera_capture import start_cameras, stop_cameras, CaptureConfig
+from camera_capture import start_cameras, stop_cameras, CaptureConfig, CameraConfig
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -21,33 +21,80 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def load_cameras_from_json(config_path: str) -> list:
+    """Load camera configurations from JSON file."""
+    logger.info(f"Loading camera config from: {config_path}")
+    
+    if not os.path.exists(config_path):
+        logger.error(f"Camera config not found: {config_path}")
+        return []
+
+    with open(config_path, 'r') as f:
+        data = json.load(f)
+    
+    # Get global settings
+    global_config = data.get('global', {})
+    motion_enabled = global_config.get('motion_detection', True)  # Default to True for backward compatibility
+    
+    cameras = []
+    for cam_data in data.get('cameras', []): # Use .get() for robustness
+        if not cam_data.get('enabled', True):
+            continue
+        
+        # Add motion_enabled from global config
+        cameras.append(CameraConfig(
+            camera_id=cam_data.get('id', cam_data.get('camera_id')), # Keep original robustness
+            rtsp_url=cam_data.get('source', cam_data.get('rtsp_url')), # Keep original robustness
+            fps=cam_data.get('fps', 5),
+            motion_threshold=cam_data.get('motion_threshold', 0.02),
+            motion_enabled=motion_enabled  # Add global motion detection setting
+        ))
+    
+    logger.info(f"Loaded {len(cameras)} cameras")
+    return cameras
+
+
 def main():
     """Main entry point for camera capture service."""
     logger.info("Starting Camera Capture Service...")
     
-    # Load config from environment
+    config_path = os.getenv("CAMERA_CONFIG_PATH", "cameras.json")
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            config_path
+        )
+    
+    logger.info(f"Loading camera config from: {config_path}")
+    cameras = load_cameras_from_json(config_path)
+    
+    if not cameras:
+        logger.error("No cameras configured!")
+        sys.exit(1)
+    
+    logger.info(f"Loaded {len(cameras)} cameras")
+    
     config = CaptureConfig(
-        redis_host=os.getenv("REDIS_HOST", "localhost"),
-        redis_port=int(os.getenv("REDIS_PORT", "6379")),
+        cameras=cameras,
+        redis={"host": os.getenv("REDIS_HOST", "localhost"), 
+               "port": int(os.getenv("REDIS_PORT", "6379"))}
     )
     
-    # Load camera config file
-    config_path = os.getenv("CAMERA_CONFIG_PATH", "/app/cameras.json")
+    # Store manager globally for shutdown handler
+    manager = None
     
-    # Setup signal handlers
     def shutdown(signum, frame):
         logger.info("Received shutdown signal, stopping cameras...")
-        stop_cameras()
+        if manager:
+            stop_cameras(manager)
         sys.exit(0)
     
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     
     try:
-        # Start cameras
-        start_cameras(config)
+        manager = start_cameras(config)
         
-        # Keep running
         logger.info("Camera Capture Service running. Press Ctrl+C to stop.")
         signal.pause()
         

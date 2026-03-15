@@ -38,9 +38,18 @@ class Settings(BaseSettings):
     # ECS Configuration
     ecs_correlation_window_ms: int = Field(default=400, description="ECS correlation window")
     ecs_hard_ttl_seconds: float = Field(default=2.0, description="ECS frame TTL")
-    ecs_weapon_threshold: float = Field(default=0.85, description="Weapon confidence threshold")
-    ecs_fire_threshold: float = Field(default=0.75, description="Fire confidence threshold")
-    ecs_fall_threshold: float = Field(default=0.80, description="Fall confidence threshold")
+    ecs_weapon_threshold: Optional[float] = Field(
+        default=None,
+        description="Weapon confidence threshold (None = ECS default)"
+    )
+    ecs_fire_threshold: Optional[float] = Field(
+        default=None,
+        description="Fire confidence threshold (None = ECS default)"
+    )
+    ecs_fall_threshold: Optional[float] = Field(
+        default=None,
+        description="Fall confidence threshold (None = ECS default)"
+    )
     ecs_fire_min_frames: int = Field(default=2, description="Fire persistence frames")
     
     # Camera Configuration
@@ -98,13 +107,19 @@ def get_redis_config() -> dict:
 def get_ecs_config() -> dict:
     """Get ECS configuration for starting the service."""
     settings = get_settings()
-    return {
+    config = {
         "redis_host": settings.redis_host,
         "redis_port": settings.redis_port,
         "correlation_window_ms": settings.ecs_correlation_window_ms,
         "hard_ttl_seconds": settings.ecs_hard_ttl_seconds,
-        "weapon_confidence_threshold": settings.ecs_weapon_threshold,
-        "fire_confidence_threshold": settings.ecs_fire_threshold,
-        "fall_confidence_threshold": settings.ecs_fall_threshold,
         "fire_min_frames": settings.ecs_fire_min_frames,
     }
+
+    if settings.ecs_weapon_threshold is not None:
+        config["weapon_confidence_threshold"] = settings.ecs_weapon_threshold
+    if settings.ecs_fire_threshold is not None:
+        config["fire_confidence_threshold"] = settings.ecs_fire_threshold
+    if settings.ecs_fall_threshold is not None:
+        config["fall_confidence_threshold"] = settings.ecs_fall_threshold
+
+    return config

@@ -7,6 +7,8 @@ Consumes from ONE queue, runs ONE model, publishes to results stream.
 
 import time
 import logging
+import os
+import cv2
 from multiprocessing import Process, Event
 from typing import Optional
 
@@ -185,11 +187,9 @@ class AIWorker:
                 inter_op_num_threads=self.config.inter_op_num_threads
             )
             
-            # Initialize preprocessor
+            # Initialize preprocessor (YOLOv8: /255 only, no ImageNet normalization)
             self.preprocessor = Preprocessor(
-                target_size=(self.config.input_width, self.config.input_height),
-                normalize_mean=self.config.normalize_mean,
-                normalize_std=self.config.normalize_std
+                target_size=(self.config.input_width, self.config.input_height)
             )
             
             # Initialize inference engine
@@ -218,6 +218,12 @@ class AIWorker:
         """Main inference loop."""
         self.logger.info("Starting inference loop")
         
+        # Store base logger to avoid recursive LoggerAdapter wrapping
+        base_logger = self.logger
+
+        last_heartbeat = time.time()
+        heartbeat_interval_sec = 30.0
+        
         while not self.stop_event.is_set():
             try:
                 # 1. Consume task from Redis queue
@@ -227,9 +233,11 @@ class AIWorker:
                     # Timeout - no task available
                     continue
                 
-                # Update logger context with task info
+                # Create fresh adapter from BASE logger (not self.logger!)
+                # Previous code wrapped self.logger repeatedly, causing
+                # RecursionError after ~800 frames
                 self.logger = logging.LoggerAdapter(
-                    self.logger,
+                    base_logger,
                     {
                         'camera_id': task.camera_id,
                         'frame_id': task.frame_id
@@ -239,18 +247,32 @@ class AIWorker:
                 # Track inference timing
                 start_time = time.time()
                 
+                # Log task consumption
+                base_logger.info(
+                    f"Processing task {task.frame_id}",
+                    extra={
+                        "camera_id": task.camera_id,
+                        "model": self.config.model_type,
+                        "shared_memory_key": task.shared_memory_key
+                    }
+                )
+                
                 # 2. Read frame from shared memory (READ-ONLY)
                 frame = self.frame_manager.read_frame(task.shared_memory_key)
                 
                 if frame is None:
-                    self.logger.warning("Frame not found in shared memory, skipping")
+                    base_logger.error(
+                        f"FRAME_NOT_FOUND {task.frame_id}",
+                        extra={
+                            "camera_id": task.camera_id,
+                            "shared_memory_key": task.shared_memory_key
+                        }
+                    )
                     continue
                 
                 # 3. Preprocess
                 input_tensor = self.preprocessor.preprocess(frame)
                 
-
-                time.sleep(0.3)
                 # 4. Run inference
                 output = self.inference_engine.run(input_tensor)
                 
@@ -264,27 +286,55 @@ class AIWorker:
                 if result:
                     result["inference_latency_ms"] = inference_latency_ms
                     
+                    # Save detection image with bounding box (only if above image threshold)
+                    # Image threshold is higher than publish threshold to reduce gallery noise
+                    image_threshold = float(os.getenv("IMAGE_SAVE_THRESHOLD", "0.50"))
+                    detection_image_path = ""
+                    if result.get("confidence", 0) >= image_threshold:
+                        detection_image_path = self._save_detection_image(
+                            frame, result, task, base_logger
+                        )
+                        if detection_image_path:
+                            result["detection_image"] = detection_image_path
+                    
                     self.result_publisher.publish(
                         task=task,
                         result=result,
                         model_type=self.config.model_type
                     )
                     
-                    self.logger.info(
-                        f"Inference completed and published",
+                    base_logger.info(
+                        f"DETECTION {task.frame_id} confidence={result.get('confidence', 0):.3f}",
                         extra={
+                            "camera_id": task.camera_id,
+                            "model": self.config.model_type,
                             "confidence": result.get("confidence"),
-                            "inference_latency_ms": round(inference_latency_ms, 2)
+                            "inference_latency_ms": round(inference_latency_ms, 2),
+                            "detection_image": detection_image_path or "none"
                         }
                     )
                 else:
-                    self.logger.debug(
-                        f"Result below confidence threshold, not published",
-                        extra={"inference_latency_ms": round(inference_latency_ms, 2)}
+                    base_logger.debug(
+                        f"BELOW_THRESHOLD {task.frame_id}",
+                        extra={
+                            "camera_id": task.camera_id,
+                            "model": self.config.model_type,
+                            "inference_latency_ms": round(inference_latency_ms, 2)
+                        }
                     )
                 
                 # NO CLEANUP - AI Worker is READ-ONLY
                 # Event Classification Service owns frame cleanup
+
+                if time.time() - last_heartbeat >= heartbeat_interval_sec:
+                    base_logger.info(
+                        "AI worker heartbeat",
+                        extra={
+                            "tasks_consumed": self.task_consumer.tasks_consumed,
+                            "publish_failures": self.result_publisher.publish_failures
+                        }
+                    )
+                    last_heartbeat = time.time()
                 
             except KeyboardInterrupt:
                 self.logger.info("Received keyboard interrupt")
@@ -299,6 +349,85 @@ class AIWorker:
         
         self.logger.info("Inference loop ended")
     
+    def _save_detection_image(
+        self,
+        frame: 'np.ndarray',
+        result: dict,
+        task: 'TaskMetadata',
+        logger: logging.Logger
+    ) -> str:
+        """
+        Draw bounding box on frame and save as JPEG for debug UI.
+        
+        Returns the saved image path, or empty string on failure.
+        """
+        try:
+            DETECTION_DIR = "/data/visionguard/detections"
+            os.makedirs(DETECTION_DIR, exist_ok=True)
+            
+            # Make a copy to avoid modifying the original
+            annotated = frame.copy()
+            h, w = annotated.shape[:2]
+            
+            # Get bbox (in 640x640 preprocessed coords) and scale to original frame
+            bbox = result.get("bbox")
+            confidence = result.get("confidence", 0.0)
+            
+            if bbox and len(bbox) == 4:
+                x1 = int(bbox[0] * w / 640)
+                y1 = int(bbox[1] * h / 640)
+                x2 = int(bbox[2] * w / 640)
+                y2 = int(bbox[3] * h / 640)
+                
+                # Clamp to frame bounds
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                
+                # Color by model type
+                colors = {
+                    "weapon": (0, 0, 255),    # Red
+                    "fire":   (0, 140, 255),   # Orange
+                    "fall":   (255, 100, 0),   # Blue
+                }
+                color = colors.get(self.config.model_type, (0, 255, 0))
+                
+                # Draw bounding box
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+                
+                # Draw label with confidence
+                label = f"{self.config.model_type.upper()} {confidence:.2f}"
+                font_scale = 0.8
+                thickness = 2
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                cv2.rectangle(annotated, (x1, y1 - th - 10), (x1 + tw, y1), color, -1)
+                cv2.putText(annotated, label, (x1, y1 - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+            
+            # Save with timestamp-based filename
+            ts = int(time.time() * 1000)
+            filename = f"{self.config.model_type}_{task.camera_id}_{ts}.jpg"
+            filepath = os.path.join(DETECTION_DIR, filename)
+            cv2.imwrite(filepath, annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            
+            # Auto-cleanup: keep only last 50 images per model type
+            try:
+                prefix = f"{self.config.model_type}_"
+                all_images = sorted([
+                    f for f in os.listdir(DETECTION_DIR)
+                    if f.startswith(prefix) and f.endswith('.jpg')
+                ])
+                if len(all_images) > 50:
+                    for old in all_images[:-50]:
+                        os.remove(os.path.join(DETECTION_DIR, old))
+            except Exception:
+                pass
+            
+            return filepath
+            
+        except Exception as e:
+            logger.warning(f"Failed to save detection image: {e}")
+            return ""
+
     def _shutdown(self) -> None:
         """Cleanup resources."""
         self.logger.info("Shutting down AI worker")

@@ -36,9 +36,11 @@ def _ecs_process_target(config_dict: dict) -> None:
     # Create config from dict
     config = ECSConfig(**config_dict)
     
-    # Create and run service
+    # Create and start service
     service = ECSService(config)
-    service.run()  # Blocks until shutdown
+    service.start()
+    if service.process:
+        service.process.join()
 
 
 class ECSManager:

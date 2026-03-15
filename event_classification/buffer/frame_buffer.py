@@ -6,6 +6,7 @@ Single source of truth for frame correlation.
 """
 
 import logging
+import time
 from typing import Dict, List, Optional
 from .frame_state import FrameState, AIResult
 
@@ -159,6 +160,30 @@ class FrameBuffer:
             )
         
         return expired
+    
+    def get_frames_needing_classification(
+        self, correlation_window_ms: int
+    ) -> List[FrameState]:
+        """
+        Return frames that have aged past correlation_window_ms
+        but have not yet been classified.
+        Used for v2 periodic classification scan.
+        
+        Args:
+            correlation_window_ms: Min age in ms before classification
+            
+        Returns:
+            List of FrameState objects needing classification
+        """
+        now = time.time()
+        result = []
+        for frame_id, frame_state in self.frames.items():
+            if frame_state.classification_attempted:
+                continue
+            age_ms = (now - frame_state.first_seen_ts) * 1000
+            if age_ms >= correlation_window_ms:
+                result.append(frame_state)
+        return result
     
     def get_buffer_size(self) -> int:
         """

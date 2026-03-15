@@ -25,10 +25,10 @@ class WorkerConfig(BaseModel):
     )
     onnx_model_path: str = Field(..., description="Path to ONNX model file")
     confidence_threshold: float = Field(
-        default=0.75,
+        default=0.40,
         ge=0.0,
         le=1.0,
-        description="Minimum confidence threshold for results"
+        description="Minimum confidence threshold for results (0-1 normalized scale)"
     )
     
     # Redis configuration
@@ -50,17 +50,9 @@ class WorkerConfig(BaseModel):
         description="ONNX inter-op threads"
     )
     
-    # Model-specific preprocessing
+    # Model input size
     input_width: int = Field(default=640, ge=32, description="Model input width")
     input_height: int = Field(default=640, ge=32, description="Model input height")
-    normalize_mean: list = Field(
-        default=[0.485, 0.456, 0.406],
-        description="Normalization mean (ImageNet default)"
-    )
-    normalize_std: list = Field(
-        default=[0.229, 0.224, 0.225],
-        description="Normalization std (ImageNet default)"
-    )
     
     # Logging
     log_level: str = Field(default="INFO", description="Log level")
@@ -108,12 +100,6 @@ class WorkerConfig(BaseModel):
             raise ValueError('log_format must be "json" or "text"')
         return v
     
-    @validator('normalize_mean', 'normalize_std')
-    def validate_normalization(cls, v):
-        if len(v) != 3:
-            raise ValueError('Normalization values must have 3 elements (RGB)')
-        return v
-    
     class Config:
         """Pydantic configuration."""
         validate_assignment = True
@@ -136,6 +122,7 @@ class ResultMetadata(BaseModel):
     bbox: Optional[list] = None  # [x1, y1, x2, y2] for object detection
     timestamp: float
     inference_latency_ms: float  # REQUIRED for capacity planning
+    detection_image: Optional[str] = None  # Path to annotated frame image
     
     def to_dict(self) -> dict:
         """Convert to dictionary for Redis serialization."""
@@ -150,6 +137,12 @@ class ResultMetadata(BaseModel):
         }
         
         if self.bbox is not None:
-            result["bbox"] = self.bbox
+            # Redis XADD requires scalar types - serialize list to JSON string
+            import json
+            result["bbox"] = json.dumps(self.bbox)
+        
+        if self.detection_image:
+            result["detection_image"] = self.detection_image
         
         return result
+

@@ -5,8 +5,11 @@ Clean startup/shutdown hooks for backend control.
 """
 
 from typing import Dict
+import logging
 from ..config import WorkerConfig
 from .worker import AIWorker
+
+logger = logging.getLogger(__name__)
 
 
 def start_worker(config: WorkerConfig) -> AIWorker:
@@ -69,7 +72,7 @@ def get_worker_status(worker: AIWorker) -> Dict[str, any]:
     Example:
         status = get_worker_status(worker)
         if not status["is_alive"]:
-            print("Worker is dead, restarting...")
+            logger.warning("Worker is dead, restarting...")
     """
     return {
         "is_alive": worker.is_alive(),
